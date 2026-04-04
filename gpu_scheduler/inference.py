@@ -120,8 +120,17 @@ SYSTEM_PROMPT = textwrap.dedent("""
       WAIT                          Advance the clock. Use when cluster is full, queue is empty,
                                     or you are clearing space for a large incoming job.
 
-    REWARD SIGNALS (continuous, not just end-of-episode)
-    ------------------------------------------------------
+    CRITICAL RULES
+    ---------------
+    • job_id MUST come from the "SCHEDULABLE JOBS" list in the observation.
+    • Job IDs always look like "job_000", "job_001", etc. NEVER use anything else.
+    • Do NOT use task names, node names, or any other text as a job_id.
+    • If SCHEDULABLE JOBS is empty, you MUST respond with WAIT.
+    • Do NOT re-schedule a job that is already running (listed under RUNNING JOBS).
+    • Pick a node_id (0–7) that has enough free GPUs for the job.
+
+    REWARD SIGNALS
+    ---------------
     + Progress reward:  proportional to job completion per step (weighted by priority)
     − Compute burn:     ongoing cost per active GPU per hour
     − Preemption burn:  10× (gpu_count × remaining_hours × hourly_rate)
@@ -130,16 +139,17 @@ SYSTEM_PROMPT = textwrap.dedent("""
 
     STRATEGY TIPS
     --------------
-    • Keep GPUs busy — idle GPUs still cost money
+    • Schedule ALL queued jobs as fast as possible — idle GPUs still cost money
+    • Prefer nodes with MORE free GPUs to avoid contention
     • Memory contention > 0.7 on a node degrades all jobs there; spread load
-    • For 32-GPU P0 jobs: identify 4 nodes with 8 free GPUs each, then SCHEDULE
+    • For multi-node jobs (>8 GPUs): pick nodes with 8 free GPUs each
     • Watch deadline_hour — if a job's deadline is close, prioritise it
-    • WAIT is free only when you genuinely have nothing useful to schedule
+    • WAIT only when the queue is empty or cluster is truly full
 
     OUTPUT FORMAT
     --------------
-    Line 1: your action (SCHEDULE / PREEMPT / WAIT)
-    Line 2+: optional brief reasoning (ignored by evaluator, useful for debugging)
+    Line 1: EXACTLY one action — SCHEDULE job_XXX N / PREEMPT job_XXX / WAIT
+    Do NOT output anything else on line 1. No explanations, no apologies.
 
     Example responses:
       SCHEDULE job_007 3
@@ -172,12 +182,12 @@ def format_observation(obs: GpuSchedulerObservation, step: int) -> str:
     """
     lines: List[str] = []
 
-    # --- Header ---
+    # --- Header (avoid exposing task_name as a schedulable entity) ---
     hours_left = obs.total_hours - obs.current_hour
     lines += [
         f"=== Step {step} | Hour {obs.current_hour:.0f} / {obs.total_hours:.0f} "
         f"({hours_left:.0f}h remaining) ===",
-        f"Task: {obs.task_name} | Compute Burn: ${obs.compute_burn_so_far:,.0f}",
+        f"Compute Burn: ${obs.compute_burn_so_far:,.0f}",
         f"Last action: {obs.last_action_result or '(start of episode)'}",
         "",
     ]
@@ -226,6 +236,20 @@ def format_observation(obs: GpuSchedulerObservation, step: int) -> str:
             )
     else:
         lines.append("  (queue is empty)")
+
+    # --- Schedulable summary — explicit list of valid job_ids ---
+    if obs.queue:
+        job_ids = [job.job_id for job in obs.queue]
+        lines += ["", f"SCHEDULABLE JOBS (use ONLY these with SCHEDULE): {', '.join(job_ids)}"]
+    else:
+        lines += ["", "SCHEDULABLE JOBS: none — you MUST respond with WAIT"]
+
+    # --- Available nodes summary ---
+    free_nodes = [f"node {n.node_id}({n.free_gpus} free)" for n in obs.nodes if n.free_gpus > 0]
+    if free_nodes:
+        lines.append(f"AVAILABLE NODES: {', '.join(free_nodes)}")
+    else:
+        lines.append("AVAILABLE NODES: none — cluster is full, use WAIT or PREEMPT")
 
     return "\n".join(lines)
 
@@ -280,6 +304,53 @@ def parse_action(response: str) -> GpuSchedulerAction:
 # LLM call — builds the full prompt and returns (action, raw_response)
 # ---------------------------------------------------------------------------
 
+def validate_action(
+    action: GpuSchedulerAction,
+    obs: GpuSchedulerObservation,
+) -> GpuSchedulerAction:
+    """
+    Validate an LLM-proposed action against the current observation.
+
+    If the action references an invalid job_id (not in queue) or an
+    invalid node (not enough free GPUs), attempt to auto-correct by
+    scheduling the highest-priority queued job on the best available node.
+    Falls back to WAIT if no valid scheduling is possible.
+    """
+    queue_ids = {job.job_id for job in obs.queue}
+    free_by_node = {n.node_id: n.free_gpus for n in obs.nodes}
+
+    if action.action_type == "SCHEDULE":
+        job_valid = action.job_id in queue_ids
+        node_valid = (
+            action.node_id is not None
+            and action.node_id in free_by_node
+            and free_by_node[action.node_id] > 0
+        )
+        if job_valid and node_valid:
+            return action
+
+        # Auto-correct: pick highest-priority queued job + best node
+        if obs.queue:
+            best_job = sorted(obs.queue, key=lambda j: (j.priority, -j.hours_in_queue))[0]
+            best_node = max(obs.nodes, key=lambda n: n.free_gpus)
+            if best_node.free_gpus >= best_job.gpu_count:
+                return GpuSchedulerAction(
+                    action_type="SCHEDULE",
+                    job_id=best_job.job_id,
+                    node_id=best_node.node_id,
+                )
+
+        return GpuSchedulerAction(action_type="WAIT")
+
+    if action.action_type == "PREEMPT":
+        running_ids = {job.job_id for job in obs.active_jobs}
+        if action.job_id in running_ids:
+            return action
+        return GpuSchedulerAction(action_type="WAIT")
+
+    return action
+
+
 def get_llm_action(
     client: OpenAI,
     obs: GpuSchedulerObservation,
@@ -291,25 +362,15 @@ def get_llm_action(
 
     Includes the last 3 history entries so the model can see the recent
     trajectory and avoid repeating useless WAIT actions.
-
-    Args:
-        client:  OpenAI-compatible client pointed at the configured endpoint.
-        obs:     Current observation from the environment.
-        step:    Current agent step index (used in the observation header).
-        history: Rolling log of recent (step, action, reward) strings.
-
-    Returns:
-        Tuple of (parsed GpuSchedulerAction, raw LLM response string).
     """
-    # Build the state block for this step
     state_text = format_observation(obs, step)
 
-    # Append recent trajectory so the LLM sees cause→effect chains
     history_block = "\n".join(history[-3:]) if history else "No prior steps."
     user_prompt = (
         f"{state_text}\n\n"
         f"RECENT TRAJECTORY:\n{history_block}\n\n"
-        f"What is your next action?"
+        f"Respond with exactly one action on the first line. "
+        f"Valid job_ids: {', '.join(j.job_id for j in obs.queue) or 'NONE (use WAIT)'}"
     )
 
     try:
@@ -324,10 +385,11 @@ def get_llm_action(
             stream=False,
         )
         raw = (completion.choices[0].message.content or "WAIT").strip()
-        return parse_action(raw), raw
+        action = parse_action(raw)
+        action = validate_action(action, obs)
+        return action, raw
 
     except Exception as exc:
-        # Never crash the episode on an API error — just WAIT and log
         print(f"[DEBUG] LLM request failed at step {step}: {exc}", flush=True)
         return GpuSchedulerAction(action_type="WAIT"), "WAIT (api-error fallback)"
 
