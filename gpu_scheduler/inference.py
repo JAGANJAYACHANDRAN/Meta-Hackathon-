@@ -22,6 +22,8 @@ STDOUT FORMAT (one block per task)
 ------------------------------------
   [START] task=<name> env=gpu_scheduler model=<model>
   [STEP]  step=<n> action=<str> reward=<0.00> done=<true|false> error=<msg|null>
+          Optional indented "state" block on following lines (sim hour, nodes,
+          running vs queued, GPUs per node).
   [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...>
 
 TASK SCHEDULE
@@ -115,8 +117,8 @@ SYSTEM_PROMPT = textwrap.dedent("""
                                     The node must have enough free GPUs.
                                     Jobs needing >8 GPUs span multiple nodes
                                     (e.g. 32-GPU job → any 4 nodes with ≥8 free GPUs each).
-      PREEMPT <job_id>              Evict a running job. HUGE penalty = 10× remaining runtime cost.
-                                    Only use to free space for a P0 job you cannot schedule otherwise.
+      PREEMPT <job_id>              Evict a running job. Penalty = 2× wasted work since last checkpoint.
+                                    Viable when freeing space for higher-priority jobs.
       WAIT                          Advance the clock. Use when cluster is full, queue is empty,
                                     or you are clearing space for a large incoming job.
 
@@ -132,18 +134,20 @@ SYSTEM_PROMPT = textwrap.dedent("""
     REWARD SIGNALS
     ---------------
     + Progress reward:  proportional to job completion per step (weighted by priority)
-    − Compute burn:     ongoing cost per active GPU per hour
-    − Preemption burn:  10× (gpu_count × remaining_hours × hourly_rate)
-    − SLA violation:    large one-time penalty when a job misses its deadline
+    − Idle GPU cost:    penalty for unused GPUs (higher when schedulable work is waiting)
+    − Preemption burn:  2× (gpu_count × wasted_checkpoint_hours × hourly_rate)
+    − SLA violation:    initial penalty when deadline is missed, plus continuing penalty while overdue
     − Queue delay:      small penalty per hour P0/P1 jobs wait in queue
 
     STRATEGY TIPS
     --------------
-    • Schedule ALL queued jobs as fast as possible — idle GPUs still cost money
-    • Prefer nodes with MORE free GPUs to avoid contention
-    • Memory contention > 0.7 on a node degrades all jobs there; spread load
+    • Schedule ALL queued jobs as fast as possible — idle GPUs cost more when work is waiting
+    • Prefer nodes with MORE free GPUs to reduce contention (degrades progress quadratically)
     • For multi-node jobs (>8 GPUs): pick nodes with 8 free GPUs each
     • Watch deadline_hour — if a job's deadline is close, prioritise it
+    • Check UPCOMING ARRIVALS to plan for large incoming jobs
+    • If a large P0 job is arriving soon, consider freeing nodes in advance
+    • Preemption is viable for low-priority jobs when needed to make room
     • WAIT only when the queue is empty or cluster is truly full
 
     OUTPUT FORMAT
@@ -198,8 +202,8 @@ def format_observation(obs: GpuSchedulerObservation, step: int) -> str:
         # Visual contention bar: ▓ per 10% contention, ░ for free headroom
         filled  = int(node.memory_contention * 10)
         bar     = "▓" * filled + "░" * (10 - filled)
-        # Flag nodes that are in the danger zone for contention degradation
-        warn    = " ⚠ CONTENTION" if node.memory_contention >= 0.7 else ""
+        # Flag nodes where quadratic contention degradation is significant (>15%)
+        warn    = " ⚠ HIGH CONTENTION" if node.memory_contention >= 0.6 else ""
         jobs_str = ", ".join(node.running_jobs) if node.running_jobs else "idle"
         lines.append(
             f"  Node {node.node_id}: {node.used_gpus}/{node.total_gpus} GPUs"
@@ -236,6 +240,17 @@ def format_observation(obs: GpuSchedulerObservation, step: int) -> str:
             )
     else:
         lines.append("  (queue is empty)")
+
+    # --- Upcoming arrivals table ---
+    if obs.upcoming_jobs:
+        lines += ["", "UPCOMING ARRIVALS (arriving soon — NOT yet schedulable, plan ahead)"]
+        for job in obs.upcoming_jobs:
+            dl   = f"deadline h{job.deadline_hour:.0f}" if job.deadline_hour else "no deadline"
+            lines.append(
+                f"  {job.job_id:12s} [{job.priority_label}] | {job.gpu_count:2d} GPUs"
+                f" | {job.duration_hours:.0f}h runtime"
+                f" | arrives h{job.arrival_hour:.0f} | {dl}"
+            )
 
     # --- Schedulable summary — explicit list of valid job_ids ---
     if obs.queue:
@@ -398,6 +413,47 @@ def get_llm_action(
 # Structured stdout loggers — format required by the hackathon evaluator
 # ---------------------------------------------------------------------------
 
+_STEP_LABEL_W = 18  # width for right-aligned labels in the state block
+
+
+def _step_state_line(label: str, value: str) -> str:
+    """One indented line: label right-aligned, colon, value."""
+    return f"      {label:>{_STEP_LABEL_W}} : {value}"
+
+
+def format_step_state_block(obs: GpuSchedulerObservation) -> str:
+    """
+    Multi-line cluster summary after env.step (human-readable; printed below [STEP]).
+
+    Right-aligned labels, spaced GPU columns, sim clock from observation.
+    """
+    nodes_sorted = sorted(obs.nodes, key=lambda n: n.node_id)
+    occupied = sum(1 for n in nodes_sorted if n.used_gpus > 0)
+    gpu_parts = [
+        f"n{n.node_id} {n.used_gpus:>2}/{n.total_gpus}" for n in nodes_sorted
+    ]
+    # Align continuation with first line's value column (6 spaces + label + " : ")
+    value_indent = 6 + _STEP_LABEL_W + 3
+    cont = " " * value_indent
+    gpu_line1 = "   ".join(gpu_parts[:4])
+    gpu_line2 = "   ".join(gpu_parts[4:]) if len(gpu_parts) > 4 else ""
+    lines = [
+        _step_state_line(
+            "sim_hour",
+            f"{obs.current_hour:.0f} / {obs.total_hours:.0f}",
+        ),
+        _step_state_line("occupied_nodes", str(occupied)),
+        _step_state_line(
+            "jobs",
+            f"running {len(obs.active_jobs)}    queued {len(obs.queue)}",
+        ),
+        _step_state_line("GPUs per node", gpu_line1),
+    ]
+    if gpu_line2:
+        lines.append(f"{cont}{gpu_line2}")
+    return "\n".join(lines)
+
+
 def log_start(task: str, env_name: str, model: str) -> None:
     """Emit the mandatory [START] line at the beginning of each episode."""
     print(f"[START] task={task} env={env_name} model={model}", flush=True)
@@ -409,6 +465,7 @@ def log_step(
     reward: float,
     done: bool,
     error: Optional[str],
+    obs: Optional[GpuSchedulerObservation] = None,
 ) -> None:
     """Emit one [STEP] line immediately after env.step() returns."""
     error_val = error if error else "null"
@@ -417,6 +474,8 @@ def log_step(
         f"reward={reward:.2f} done={str(done).lower()} error={error_val}",
         flush=True,
     )
+    if obs is not None:
+        print(format_step_state_block(obs), flush=True)
 
 
 def log_end(
@@ -499,7 +558,14 @@ async def run_task(
             rewards.append(reward)
             steps_taken = step
 
-            log_step(step=step, action=action_str, reward=reward, done=done, error=error)
+            log_step(
+                step=step,
+                action=action_str,
+                reward=reward,
+                done=done,
+                error=error,
+                obs=obs,
+            )
 
             # Rolling history: compact one-liner per step for the LLM context window
             history.append(

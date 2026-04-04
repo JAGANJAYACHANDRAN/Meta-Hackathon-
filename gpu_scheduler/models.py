@@ -163,7 +163,7 @@ class NodeInfo(BaseModel):
 
     Each node has 8 physical GPUs.  Memory contention rises as more
     GPU-hours are colocated on the same PCIe bus, degrading job progress
-    rates above the 0.7 contention threshold.
+    rates via a smooth quadratic curve (rate = 1 - 0.4 × contention²).
     """
 
     node_id: int = Field(
@@ -194,7 +194,7 @@ class NodeInfo(BaseModel):
         le=1.0,
         description=(
             "Normalised contention level (0.0 = no contention, 1.0 = fully saturated). "
-            "Above 0.7 all jobs on this node suffer a progress rate penalty."
+            "Higher contention smoothly degrades job progress (quadratic curve)."
         ),
     )
     running_jobs: List[str] = Field(
@@ -245,10 +245,13 @@ class GpuSchedulerObservation(Observation):
     )
     queue: List[JobInfo] = Field(
         default_factory=list,
+        description="Jobs waiting to be scheduled (ready to place now).",
+    )
+    upcoming_jobs: List[JobInfo] = Field(
+        default_factory=list,
         description=(
-            "Jobs waiting to be scheduled. "
-            "Includes a ~4-hour lookahead window of upcoming arrivals "
-            "so the agent can plan proactively."
+            "Preview of jobs arriving in the next few hours (NOT yet schedulable). "
+            "Allows the agent to plan ahead for large or high-priority incoming work."
         ),
     )
 

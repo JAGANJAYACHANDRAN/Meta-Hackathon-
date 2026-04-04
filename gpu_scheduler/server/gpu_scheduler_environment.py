@@ -11,8 +11,8 @@ Simulates an 8-node × 8-GPU cluster ($100,000/day) where an agent
 must schedule, preempt, and wait to minimise "compute burn".
 
 Three tasks of escalating difficulty:
-    EASY   — smooth_sailing:   24h,  low-demand FIFO scheduling
-    MEDIUM — deadline_crunch:  72h,  overlapping P1/P2 jobs with tight SLAs
+    EASY   — smooth_sailing:   24h,  moderate demand P1–P3 mix with some deadlines
+    MEDIUM — deadline_crunch:  72h,  P1–P3 jobs with bursty arrivals and tight SLAs
     HARD   — p0_emergency:    168h,  32-GPU P0 gang job arrives at hour 72
 """
 
@@ -65,9 +65,9 @@ REWARD_SCALE = 1.0 / HOURLY_RATE_CLUSTER
 # ---------------------------------------------------------------------------
 # Simulation tuning knobs
 # ---------------------------------------------------------------------------
-CONTENTION_THRESHOLD       = 0.7   # above this ratio, job progress rate degrades
-PREEMPTION_BURN_MULTIPLIER = 10.0  # preemption costs 10× the remaining compute value
-MAX_CONTENTION_SLOWDOWN    = 0.5   # at 100% contention, jobs run at 50% speed
+CONTENTION_DEGRADATION      = 0.4   # smooth quadratic: rate = 1 - 0.4 × contention²
+PREEMPTION_BURN_MULTIPLIER  = 2.0   # preemption costs 2× the wasted checkpoint work
+PREEMPTION_CHECKPOINT_HOURS = 2.0   # assumed checkpoint interval in hours
 
 # P0 progress contributes 2× more reward than P3 (encourages prioritising critical work)
 PRIORITY_WEIGHTS: Dict[int, float] = {0: 2.0, 1: 1.5, 2: 1.0, 3: 0.5}
@@ -82,22 +82,25 @@ PRIORITY_QUEUE_FACTORS: Dict[int, float] = {0: 2.0, 1: 1.0, 2: 0.0, 3: 0.0}
 # ---------------------------------------------------------------------------
 TASK_CONFIGS: Dict[str, Dict] = {
     "smooth_sailing": {
-        "total_hours":    24.0,
-        "hours_per_step":  1.0,    # 24 agent steps total
-        "seed":           42,
-        "description":    "Low-demand 24h window. Keep GPUs busy, avoid waste.",
+        "total_hours":     24.0,
+        "hours_per_step":   1.0,    # 24 agent steps total
+        "lookahead_hours":  6.0,
+        "seed":            42,
+        "description":     "24h window with moderate demand. P1–P3 mix, some deadlines.",
     },
     "deadline_crunch": {
-        "total_hours":    72.0,
-        "hours_per_step":  2.0,    # 36 agent steps total
-        "seed":           137,
-        "description":    "72h with overlapping P1/P2 jobs and tight deadlines.",
+        "total_hours":     72.0,
+        "hours_per_step":   2.0,    # 36 agent steps total
+        "lookahead_hours": 12.0,
+        "seed":            137,
+        "description":     "72h with P1–P3 jobs, bursty arrivals, tight deadlines.",
     },
     "p0_emergency": {
-        "total_hours":   168.0,
-        "hours_per_step":  4.0,    # 42 agent steps total
-        "seed":           999,
-        "description":    "One-week run. A 32-GPU P0 job arrives at hour 72. Plan ahead.",
+        "total_hours":    168.0,
+        "hours_per_step":   4.0,    # 42 agent steps total
+        "lookahead_hours": 24.0,
+        "seed":            999,
+        "description":     "One-week run. A 32-GPU P0 job arrives at hour 72. Plan ahead.",
     },
 }
 
@@ -133,33 +136,41 @@ def _generate_job_schedule(task_name: str, rng: random.Random) -> List[Dict]:
     idx = 0
 
     if task_name == "smooth_sailing":
-        # ~12 small, simple jobs spread evenly over 24 hours.
-        # No deadlines — agent just needs to keep GPUs occupied efficiently.
-        arrival_hours = [0, 1, 2, 4, 5, 7, 9, 11, 14, 17, 20, 23]
+        # ~24 jobs with moderate GPU demand spread across 24h.
+        # Includes P1 jobs and some deadlines for real scheduling pressure.
+        arrival_hours = [0, 0, 1, 2, 3, 4, 5, 5, 7, 8, 9, 10,
+                         10, 12, 13, 14, 15, 16, 17, 17, 18, 19, 20, 22]
         for hour in arrival_hours:
-            gpu_count = rng.choice([1, 2, 2, 4])       # small jobs only
-            priority  = rng.choice([2, 2, 3])           # P2 / P3 mix
+            gpu_count = rng.choice([2, 2, 4, 4, 8])
+            priority  = rng.choice([1, 2, 2, 2, 3])
+            duration  = round(rng.uniform(2.0, 7.0), 1)
+            has_dl    = rng.random() < 0.35 and priority <= 2
+            deadline  = round(hour + duration + rng.uniform(3.0, 10.0), 1) if has_dl else None
             jobs.append({
                 "job_id":         _make_job_id(idx),
                 "priority":       priority,
                 "priority_label": f"P{priority}",
                 "gpu_count":      gpu_count,
-                "duration_hours": round(rng.uniform(2.0, 8.0), 1),
-                "deadline_hour":  None,                 # no SLA on this task
+                "duration_hours": duration,
+                "deadline_hour":  deadline,
                 "arrival_hour":   float(hour),
             })
             idx += 1
 
     elif task_name == "deadline_crunch":
-        # ~28 mixed P1/P2 jobs with bursty arrivals; 75% carry tight deadlines.
-        # Agent must juggle SLA compliance AND utilisation across a 72h window.
-        raw_arrivals = sorted(rng.uniform(0.0, 68.0) for _ in range(28))
+        # ~30 jobs with P1–P3 mix and bursty arrivals.
+        # P3 spot jobs can be sacrificed; P1 jobs carry tight deadlines.
+        raw_arrivals = sorted(rng.uniform(0.0, 68.0) for _ in range(30))
         for hour in raw_arrivals:
             gpu_count = rng.choice([2, 4, 4, 8])
-            priority  = rng.choice([1, 1, 2, 2, 2])
+            priority  = rng.choice([1, 1, 1, 2, 2, 2, 2, 3])
             duration  = round(rng.uniform(3.0, 16.0), 1)
-            # Tight deadline: arrival time + full runtime + small grace window
-            has_dl   = rng.random() < 0.75
+            if priority <= 1:
+                has_dl = rng.random() < 0.85
+            elif priority == 2:
+                has_dl = rng.random() < 0.65
+            else:
+                has_dl = False
             deadline = round(hour + duration + rng.uniform(2.0, 8.0), 1) if has_dl else None
             jobs.append({
                 "job_id":         _make_job_id(idx),
@@ -250,10 +261,11 @@ class GpuSchedulerEnvironment(Environment):
         self._state = State(episode_id=str(uuid4()), step_count=0)
 
         # Task configuration — populated by reset()
-        self._task_name:      str   = "smooth_sailing"
-        self._total_hours:    float = 24.0
-        self._hours_per_step: float = 1.0
-        self._current_hour:   float = 0.0
+        self._task_name:       str   = "smooth_sailing"
+        self._total_hours:     float = 24.0
+        self._hours_per_step:  float = 1.0
+        self._lookahead_hours: float = 6.0
+        self._current_hour:    float = 0.0
 
         # Cluster state: one entry per physical node (0–7)
         self._node_jobs:     Dict[int, List[str]] = {i: [] for i in range(NUM_NODES)}
@@ -269,12 +281,13 @@ class GpuSchedulerEnvironment(Environment):
         # Episode-level metrics consumed by the task graders
         self._total_jobs_spawned:       int   = 0
         self._sla_jobs_total:           int   = 0
-        self._sla_jobs_met:             int   = 0
+        self._sla_jobs_met:             float = 0.0
         self._p0_job_completed:         bool  = False
         self._cumulative_gpu_hrs_used:  float = 0.0
         self._cumulative_gpu_hrs_avail: float = 0.0
         self._compute_burn_usd:         float = 0.0
         self._cumulative_reward:        float = 0.0
+        self._sla_penalized_jobs:       set   = set()
 
         # Plain-English result of the last action (shown to the LLM each step)
         self._last_action_result: str = ""
@@ -310,10 +323,11 @@ class GpuSchedulerEnvironment(Environment):
             task_name = "smooth_sailing"    # safe fallback
 
         cfg = TASK_CONFIGS[task_name]
-        self._task_name      = task_name
-        self._total_hours    = cfg["total_hours"]
-        self._hours_per_step = cfg["hours_per_step"]
-        self._current_hour   = 0.0
+        self._task_name       = task_name
+        self._total_hours     = cfg["total_hours"]
+        self._hours_per_step  = cfg["hours_per_step"]
+        self._lookahead_hours = cfg.get("lookahead_hours", 12.0)
+        self._current_hour    = 0.0
 
         # Wipe all episode state
         self._state           = State(episode_id=str(uuid4()), step_count=0)
@@ -328,7 +342,8 @@ class GpuSchedulerEnvironment(Environment):
         # Wipe grader metrics
         self._total_jobs_spawned       = 0
         self._sla_jobs_total           = 0
-        self._sla_jobs_met             = 0
+        self._sla_jobs_met             = 0.0
+        self._sla_penalized_jobs       = set()
         self._p0_job_completed         = False
         self._cumulative_gpu_hrs_used  = 0.0
         self._cumulative_gpu_hrs_avail = 0.0
@@ -553,11 +568,12 @@ class GpuSchedulerEnvironment(Environment):
 
         Applies two penalties:
           1. Preemption Burn Penalty:
-               gpu_count × remaining_hours × hourly_rate × PREEMPTION_BURN_MULTIPLIER
-             Represents wasted electricity and compute investment.
-          2. Checkpoint Loss:
-               Job loses up to 1 simulated hour of progress (models the real cost
-               of rolling back to the last checkpoint and re-loading state).
+               gpu_count × wasted_hours × hourly_rate × PREEMPTION_BURN_MULTIPLIER
+             where wasted_hours is capped at PREEMPTION_CHECKPOINT_HOURS (the
+             assumed interval between checkpoints).
+          2. Checkpoint Rollback:
+               Job loses progress back to the last checkpoint (up to
+               PREEMPTION_CHECKPOINT_HOURS of work).
 
         P0 jobs are protected — attempting to preempt one returns an error with
         an elevated penalty to strongly discourage the behaviour in the LLM.
@@ -583,20 +599,21 @@ class GpuSchedulerEnvironment(Environment):
             )
             return -0.5    # elevated penalty for even attempting this
 
-        # --- Burn penalty: cost of all wasted GPU-hours ---
-        remaining_hours = job.duration_hours * (1.0 - job.progress)
+        # --- Burn penalty: cost of wasted work since last checkpoint ---
+        wasted_hours = min(job.elapsed_hours, PREEMPTION_CHECKPOINT_HOURS)
         burn_penalty = (
             job.gpu_count
-            * remaining_hours
+            * wasted_hours
             * HOURLY_RATE_PER_GPU
             * PREEMPTION_BURN_MULTIPLIER
             * REWARD_SCALE
         )
 
-        # --- Checkpoint loss: roll back up to 1 hour of progress ---
-        loss_fraction   = min(1.0 / max(job.duration_hours, 1.0), job.progress)
-        job.progress      = max(0.0, job.progress - loss_fraction)
-        job.elapsed_hours = max(0.0, job.elapsed_hours - 1.0)
+        # --- Checkpoint rollback: lose work since last checkpoint ---
+        rollback_hours    = min(PREEMPTION_CHECKPOINT_HOURS, job.elapsed_hours)
+        rollback_fraction = rollback_hours / max(job.duration_hours, 1.0)
+        job.progress      = max(0.0, job.progress - rollback_fraction)
+        job.elapsed_hours = max(0.0, job.elapsed_hours - rollback_hours)
 
         # --- Free cluster resources ---
         gpus_per_node = GPUS_PER_NODE if len(job.assigned_nodes) > 1 else job.gpu_count
@@ -628,13 +645,13 @@ class GpuSchedulerEnvironment(Environment):
         Advance the simulation clock by `hours` and process all side effects.
 
         Executes six operations in strict order to avoid clock-skew bugs:
-            1. Update progress for all running jobs (contention-adjusted rate)
-            2. Detect jobs that reached 100% progress → mark as completed
+            1. Update progress for all running jobs (quadratic contention degradation)
+            2. Finalise completed jobs; award full or partial SLA credit
             3. Advance the wall clock
-            4. Detect SLA violations (deadline now in the past, job not done)
+            4. Apply graduated SLA violation penalty for overdue jobs
             5. Release newly-arrived jobs from the master schedule into the queue
-            6. Apply queue-delay penalty for P0/P1 waiting in queue
-               Deduct idle-GPU opportunity cost
+            6. Apply queue-delay penalty for P0/P1 jobs in queue;
+               deduct demand-scaled idle-GPU opportunity cost
 
         Args:
             hours: Simulated hours to advance (1.0, 2.0, or 4.0 depending on task).
@@ -651,12 +668,8 @@ class GpuSchedulerEnvironment(Environment):
             # Average GPU utilisation on the nodes this job occupies
             contention = self._average_contention(job.assigned_nodes)
 
-            # Contention above threshold slows progress proportionally
-            if contention > CONTENTION_THRESHOLD:
-                excess        = (contention - CONTENTION_THRESHOLD) / (1.0 - CONTENTION_THRESHOLD)
-                progress_rate = 1.0 - MAX_CONTENTION_SLOWDOWN * excess
-            else:
-                progress_rate = 1.0    # full speed below threshold
+            # Smooth quadratic degradation: higher contention → lower speed
+            progress_rate = 1.0 - CONTENTION_DEGRADATION * contention * contention
 
             delta             = (hours / job.duration_hours) * progress_rate
             job.progress      = min(1.0, job.progress + delta)
@@ -687,9 +700,16 @@ class GpuSchedulerEnvironment(Environment):
 
             self._completed_jobs.append(job)
 
-            # SLA compliance: did the job finish before its deadline?
-            if job.deadline_hour is not None and new_hour <= job.deadline_hour:
-                self._sla_jobs_met += 1
+            # SLA compliance: full credit on-time, partial credit for slightly late
+            if job.deadline_hour is not None:
+                if new_hour <= job.deadline_hour:
+                    self._sla_jobs_met += 1.0
+                else:
+                    overdue = new_hour - job.deadline_hour
+                    if overdue <= 4.0:
+                        self._sla_jobs_met += 0.5
+                    elif overdue <= 8.0:
+                        self._sla_jobs_met += 0.25
 
             # Track the special P0 emergency job for the hard-task grader
             if job_id == "job_P0_EMERGENCY":
@@ -698,18 +718,24 @@ class GpuSchedulerEnvironment(Environment):
         # 3. Advance the simulation clock -----------------------------------------
         self._current_hour = new_hour
 
-        # 4. SLA violations: penalise running/queued jobs past their deadline ------
+        # 4. SLA violations: graduated penalty for jobs past their deadline ---------
         for job in list(self._active_jobs.values()) + list(self._queue):
             if job.deadline_hour and self._current_hour > job.deadline_hour:
-                sla_penalty = (
-                    job.gpu_count
-                    * job.duration_hours
-                    * HOURLY_RATE_PER_GPU
-                    * 5.0           # SLA violation multiplier
-                    * REWARD_SCALE
+                if job.job_id not in self._sla_penalized_jobs:
+                    initial_penalty = (
+                        job.gpu_count
+                        * job.duration_hours
+                        * HOURLY_RATE_PER_GPU
+                        * 3.0
+                        * REWARD_SCALE
+                    )
+                    reward -= initial_penalty
+                    self._sla_penalized_jobs.add(job.job_id)
+                continuing_penalty = (
+                    job.gpu_count * hours * HOURLY_RATE_PER_GPU
+                    * 0.5 * REWARD_SCALE
                 )
-                reward -= sla_penalty
-                job.deadline_hour = None    # clear so we don't double-penalise next step
+                reward -= continuing_penalty
 
         # 5. Release newly-arrived jobs into the visible queue --------------------
         self._release_arriving_jobs(from_hour=old_hour, to_hour=self._current_hour)
@@ -734,8 +760,10 @@ class GpuSchedulerEnvironment(Environment):
         self._cumulative_gpu_hrs_avail += TOTAL_GPUS  * hours
         self._compute_burn_usd         += TOTAL_GPUS  * hours * HOURLY_RATE_PER_GPU
 
-        # Penalise idle slots at 30% of full cost (opportunity cost, not full burn)
-        reward -= idle_gpus * hours * HOURLY_RATE_PER_GPU * REWARD_SCALE * 0.3
+        # Idle penalty: higher when schedulable work is waiting, low when queue is empty
+        has_pending_work = len(self._queue) > 0
+        idle_rate = 0.2 if has_pending_work else 0.05
+        reward -= idle_gpus * hours * HOURLY_RATE_PER_GPU * REWARD_SCALE * idle_rate
 
         return reward
 
@@ -781,7 +809,7 @@ class GpuSchedulerEnvironment(Environment):
 
         Contention = used_gpus / GPUS_PER_NODE per node.
         Averaged across all nodes a job occupies.
-        Values above CONTENTION_THRESHOLD (0.7) trigger progress rate penalties.
+        Used in the smooth quadratic degradation formula: rate = 1 - 0.4 × contention².
 
         Args:
             node_ids: List of node IDs a job is currently occupying.
@@ -824,8 +852,8 @@ class GpuSchedulerEnvironment(Environment):
         Each task weights different objectives to match its design intent:
 
         smooth_sailing:
-            60% job completion rate  +  40% GPU utilisation
-            → proves the agent can keep hardware busy without waste.
+            80% job completion rate  +  20% GPU utilisation
+            → proves the agent can complete jobs efficiently.
 
         deadline_crunch:
             60% SLA compliance  +  40% job completion rate
@@ -849,7 +877,7 @@ class GpuSchedulerEnvironment(Environment):
         sla_rate = self._sla_jobs_met / max(self._sla_jobs_total, 1)
 
         if self._task_name == "smooth_sailing":
-            score = 0.6 * completion_rate + 0.4 * utilisation
+            score = 0.8 * completion_rate + 0.2 * utilisation
 
         elif self._task_name == "deadline_crunch":
             score = 0.6 * sla_rate + 0.4 * completion_rate
@@ -935,6 +963,22 @@ class GpuSchedulerEnvironment(Environment):
             "sla_met":        self._sla_jobs_met,
             "sla_total":      self._sla_jobs_total,
         }
+        # --- Upcoming jobs (lookahead window) ---
+        lookahead_end = self._current_hour + self._lookahead_hours
+        already_seen: set = (
+            {j.job_id for j in self._queue}
+            | set(self._active_jobs.keys())
+            | {j.job_id for j in self._completed_jobs}
+            | {j.job_id for j in self._preempted_jobs}
+        )
+        upcoming: List[JobInfo] = []
+        for job_dict in self._job_schedule:
+            if self._current_hour < job_dict["arrival_hour"] <= lookahead_end:
+                if job_dict["job_id"] not in already_seen:
+                    info = JobInfo(**job_dict)
+                    info.status = "upcoming"
+                    upcoming.append(info)
+
         # Terminal score: populate the observation-level score field so it
         # survives OpenEnv's serialize_observation (which strips metadata).
         terminal_score: Optional[float] = None
@@ -947,6 +991,7 @@ class GpuSchedulerEnvironment(Environment):
             nodes               = nodes,
             active_jobs         = active_list,
             queue               = list(self._queue),
+            upcoming_jobs       = upcoming,
             current_hour        = round(self._current_hour, 2),
             total_hours         = self._total_hours,
             compute_burn_so_far = round(self._compute_burn_usd, 2),
