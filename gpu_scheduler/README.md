@@ -178,6 +178,29 @@ The baseline `inference.py` runs an LLM agent against all three tasks sequential
 [END] success=false steps=42 score=0.284 rewards=...
 ```
 
+### Enhanced Visual Output
+
+The inference script now includes a **Rich Logger** that provides clear, formatted output for easier debugging:
+
+```bash
+# Enable rich output (default)
+export VERBOSE_OUTPUT=1
+python inference.py
+```
+
+**Features:**
+- 📊 Formatted tables for each step with progress tracking
+- 🚨 Clear error highlighting with contextual hints
+- 📈 Episode summaries with color-coded status
+- ⚠️ Error categorization and summary table
+
+See [RICH_LOGGER.md](./RICH_LOGGER.md) for full documentation and examples.
+
+**Demo:**
+```bash
+.venv/bin/python demo_rich_logger.py
+```
+
 ---
 
 ## Baseline Scores

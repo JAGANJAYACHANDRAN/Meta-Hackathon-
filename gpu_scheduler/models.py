@@ -47,6 +47,19 @@ class ActionType(str, Enum):
     WAIT     = "WAIT"
 
 
+class ActionErrorCode(str, Enum):
+    """Structured codes for the last scheduling action (stable for logging / RL)."""
+
+    NONE = "NONE"
+    JOB_NOT_IN_QUEUE = "JOB_NOT_IN_QUEUE"
+    INSUFFICIENT_GPUS = "INSUFFICIENT_GPUS"
+    INVALID_NODE_ID = "INVALID_NODE_ID"
+    JOB_ALREADY_RUNNING = "JOB_ALREADY_RUNNING"
+    PREEMPT_P0_FORBIDDEN = "PREEMPT_P0_FORBIDDEN"
+    GANG_INSUFFICIENT_NODES = "GANG_INSUFFICIENT_NODES"
+    PREEMPT_JOB_NOT_RUNNING = "PREEMPT_JOB_NOT_RUNNING"
+
+
 class GpuSchedulerAction(Action):
     """
     Action submitted by the agent at each decision step.
@@ -288,6 +301,19 @@ class GpuSchedulerObservation(Observation):
             "'Scheduled job_003 on node 2 (6 GPUs)' or "
             "'INVALID: node 5 has only 2 free GPUs but job needs 4'."
         ),
+    )
+    last_action_error_code: Optional[ActionErrorCode] = Field(
+        default=None,
+        description="Structured error code for the last action (None if successful or WAIT).",
+    )
+    fully_free_nodes_count: int = Field(
+        default=0,
+        ge=0,
+        description="Nodes with all 8 GPUs free (needed for gang / multi-node jobs).",
+    )
+    upcoming_p0_jobs: List[str] = Field(
+        default_factory=list,
+        description="P0 job IDs not yet running that arrive within the next 8 simulated hours.",
     )
     score: Optional[float] = Field(
         default=None,

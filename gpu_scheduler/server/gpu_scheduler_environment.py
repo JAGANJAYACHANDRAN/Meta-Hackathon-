@@ -16,9 +16,10 @@ Three tasks of escalating difficulty:
     HARD   — p0_emergency:    168h,  32-GPU P0 gang job arrives at hour 72
 """
 
+import math
 import os
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
@@ -27,6 +28,7 @@ from openenv.core.env_server.types import State
 # Handles both package-relative import (normal) and direct/Docker import path
 try:
     from ..models import (
+        ActionErrorCode,
         ActionType,
         GpuSchedulerAction,
         GpuSchedulerObservation,
@@ -35,6 +37,7 @@ try:
     )
 except ImportError:
     from models import (                          # direct run / Docker fallback
+        ActionErrorCode,
         ActionType,
         GpuSchedulerAction,
         GpuSchedulerObservation,
@@ -100,6 +103,77 @@ TASK_CONFIGS: Dict[str, Dict] = {
         "description":    "One-week run. A 32-GPU P0 job arrives at hour 72. Plan ahead.",
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Resource placement helpers (best-fit, least-contention, gang)
+# ---------------------------------------------------------------------------
+
+
+class ResourceManager:
+    """GPU capacity helpers for single-node and gang placement."""
+
+    @staticmethod
+    def find_best_fit_nodes(
+        gpu_count: int,
+        node_gpu_used: Dict[int, int],
+        num_nodes: int,
+        gpus_per_node: int,
+        strategy: str = "best_fit",
+    ) -> Optional[List[int]]:
+        """
+        Return node id list that can place `gpu_count` GPUs, or None.
+
+        ``strategy`` for single-node jobs: best_fit | least_contention.
+        For multi-node (gang) jobs use strategy gang_reserve (fully free nodes only).
+        """
+        nodes_needed = (gpu_count + gpus_per_node - 1) // gpus_per_node
+
+        if nodes_needed == 1:
+            candidates: List[Tuple[int, int]] = []
+            for n in range(num_nodes):
+                free = gpus_per_node - node_gpu_used.get(n, 0)
+                if free >= gpu_count:
+                    candidates.append((n, free))
+            if not candidates:
+                return None
+            if strategy == "least_contention":
+                candidates.sort(key=lambda x: x[1], reverse=True)
+            else:
+                candidates.sort(key=lambda x: x[1])
+            return [candidates[0][0]]
+
+        fully_free = [n for n in range(num_nodes) if node_gpu_used.get(n, 0) == 0]
+        if len(fully_free) < nodes_needed:
+            return None
+        return fully_free[:nodes_needed]
+
+    @staticmethod
+    def check_gang_feasibility(
+        gpu_count: int,
+        node_gpu_used: Dict[int, int],
+        lookahead_running_jobs: List[JobInfo],
+        gpus_per_node: int,
+        num_nodes: int,
+    ) -> Tuple[bool, str]:
+        """Heuristic: can a gang job be placed soon given running jobs finishing <4h."""
+        nodes_needed = (gpu_count + gpus_per_node - 1) // gpus_per_node
+        fully_free = sum(1 for n in range(num_nodes) if node_gpu_used.get(n, 0) == 0)
+        if fully_free >= nodes_needed:
+            return True, f"{fully_free} fully-free node(s) available now"
+
+        short_jobs = [
+            j
+            for j in lookahead_running_jobs
+            if j.status == "running" and j.duration_hours * (1.0 - j.progress) < 4.0
+        ]
+        if short_jobs:
+            return True, f"{len(short_jobs)} running job(s) may finish within ~4h (sim time)"
+
+        return (
+            False,
+            f"Only {fully_free}/{nodes_needed} fully-free node(s); no short jobs finishing soon",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +272,7 @@ def _generate_job_schedule(task_name: str, rng: random.Random) -> List[Dict]:
         # *** THE P0 EMERGENCY — deterministic, always at exactly hour 72 ***
         # Needs 4 fully-free nodes (32 GPUs). Deadline = hour 132 (48h runtime + 12h grace).
         jobs.append({
-            "job_id":         "job_P0_EMERGENCY",
+            "job_id":         "job_p0_emergency",
             "priority":       0,
             "priority_label": "P0",
             "gpu_count":      32,
@@ -278,6 +352,26 @@ class GpuSchedulerEnvironment(Environment):
 
         # Plain-English result of the last action (shown to the LLM each step)
         self._last_action_result: str = ""
+        self._last_action_error_code: Optional[ActionErrorCode] = None
+        self._p0_reserved_nodes: List[int] = []
+        self._invalid_action_count: int = 0
+
+        # Optional learned node-scoring weights (ENABLE_RL_OPTIMIZER=1)
+        self._rl_optimizer: Any = None
+        if os.getenv("ENABLE_RL_OPTIMIZER") == "1":
+            try:
+                from ..rl_scheduler_optimizer import SimplifiedScoringOptimizer
+
+                self._rl_optimizer = SimplifiedScoringOptimizer()
+            except ImportError:
+                try:
+                    from rl_scheduler_optimizer import SimplifiedScoringOptimizer
+
+                    self._rl_optimizer = SimplifiedScoringOptimizer()
+                except ImportError:
+                    self._rl_optimizer = None
+
+        self._rl_optimizer_last_suggestion: Optional[int] = None
 
     # ------------------------------------------------------------------
     # OpenEnv interface — reset / step / state
@@ -324,6 +418,9 @@ class GpuSchedulerEnvironment(Environment):
         self._completed_jobs  = []
         self._preempted_jobs  = []
         self._last_action_result = "Episode started. Cluster is empty."
+        self._last_action_error_code = None
+        self._p0_reserved_nodes = []
+        self._invalid_action_count = 0
 
         # Wipe grader metrics
         self._total_jobs_spawned       = 0
@@ -341,6 +438,8 @@ class GpuSchedulerEnvironment(Environment):
 
         # Jobs arriving at exactly hour 0 go straight into the queue
         self._release_arriving_jobs(from_hour=0.0, to_hour=0.0)
+        self._sort_queue_by_priority()
+        self._p0_reserved_nodes = self._reserve_for_p0_emergency(self._current_hour)
 
         return self._build_observation(reward=0.0, done=False)
 
@@ -416,6 +515,7 @@ class GpuSchedulerEnvironment(Environment):
         """
         if action.action_type == ActionType.WAIT:
             self._last_action_result = "WAIT — advancing clock."
+            self._last_action_error_code = None
             return 0.0
 
         if action.action_type == ActionType.SCHEDULE:
@@ -446,6 +546,130 @@ class GpuSchedulerEnvironment(Environment):
         """
         return GPUS_PER_NODE - self._node_gpu_used[node_id]
 
+    def _schedule_invalidate(
+        self,
+        message: str,
+        code: ActionErrorCode,
+    ) -> float:
+        """Common handler for failed SCHEDULE actions."""
+        self._last_action_result = message
+        self._last_action_error_code = code
+        self._invalid_action_count += 1
+        return -0.1
+
+    def _nodes_with_capacity(self, gpu_count: int) -> str:
+        """Human-readable hints: nodes that can fit a single-node job."""
+        alts = [
+            f"{n} ({self._get_free_gpus(n)} free)"
+            for n in range(NUM_NODES)
+            if self._get_free_gpus(n) >= gpu_count
+        ]
+        return ", ".join(alts) if alts else "none have enough space right now"
+
+    def _compute_dynamic_priority(self, job: JobInfo) -> float:
+        """Higher = dispatch sooner. Smooth sigmoid deadline urgency."""
+        base_score = 1000.0 / (job.priority + 1)
+
+        if job.deadline_hour is not None:
+            time_to_deadline = job.deadline_hour - self._current_hour
+            time_needed = job.duration_hours * (1.0 - job.progress)
+            urgency_ratio = time_to_deadline / max(time_needed, 0.1)
+            urgency_boost = 500.0 / (1.0 + math.exp(2.0 * (urgency_ratio - 1.5)))
+            base_score += urgency_boost
+
+        if job.hours_in_queue > 4.0:
+            base_score += min(200.0, job.hours_in_queue * 10.0)
+
+        return base_score
+
+    def _sort_queue_by_priority(self) -> None:
+        """Reorder waiting jobs by dynamic priority (in-place)."""
+        if not self._queue:
+            return
+        scored = [(self._compute_dynamic_priority(j), j) for j in self._queue]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        self._queue = [j for _, j in scored]
+
+    def _upcoming_p0_job_ids(self, lookahead_hours: float = 8.0) -> List[str]:
+        """
+        P0 jobs that are not running yet and arrive within ``lookahead_hours``.
+        """
+        seen = set(self._active_jobs.keys()) | {j.job_id for j in self._completed_jobs}
+        upcoming: List[str] = []
+        horizon = self._current_hour + lookahead_hours
+
+        for job_dict in self._job_schedule:
+            jid = job_dict["job_id"]
+            if jid in seen:
+                continue
+            if job_dict.get("priority") != 0:
+                continue
+            ah = float(job_dict["arrival_hour"])
+            if self._current_hour < ah <= horizon:
+                upcoming.append(jid)
+
+        for j in self._queue:
+            if j.priority == 0 and j.job_id not in seen:
+                if j.job_id not in upcoming:
+                    upcoming.append(j.job_id)
+
+        return sorted(set(upcoming))
+
+    def _find_preemption_candidates(
+        self,
+        target_priority: int,
+    ) -> List[Tuple[str, JobInfo, float]]:
+        """
+        (job_id, job, cost) sorted by ascending cost. Lower priority / cheap victims first.
+
+        Cost scales up when the victim has a tight deadline (avoids cascading SLA loss).
+        """
+        candidates: List[Tuple[str, JobInfo, float]] = []
+
+        for jid, job in self._active_jobs.items():
+            if job.priority <= target_priority or job.priority == 0:
+                continue
+
+            remaining = job.duration_hours * (1.0 - job.progress)
+            base_cost = (
+                job.gpu_count
+                * remaining
+                * HOURLY_RATE_PER_GPU
+                * PREEMPTION_BURN_MULTIPLIER
+            )
+
+            penalty = 1.0
+            if job.deadline_hour is not None:
+                slack = job.deadline_hour - self._current_hour - remaining
+                if slack < 2.0:
+                    penalty = 3.0
+                elif slack < 4.0:
+                    penalty = 2.0
+
+            candidates.append((jid, job, base_cost * penalty))
+
+        candidates.sort(key=lambda x: x[2])
+        return candidates
+
+    def _reserve_for_p0_emergency(self, current_hour: float) -> List[int]:
+        """
+        Soft guidance: nodes to favour for draining before a known P0 gang arrival.
+        Does not block scheduling — surfaced in observation metadata only.
+        """
+        p0_queue = [j for j in self._queue if j.priority == 0 and j.gpu_count >= 24]
+        if p0_queue:
+            need = (p0_queue[0].gpu_count + GPUS_PER_NODE - 1) // GPUS_PER_NODE
+            free = [n for n in range(NUM_NODES) if self._get_free_gpus(n) == GPUS_PER_NODE]
+            if len(free) >= need:
+                return free[:need]
+            return list(range(min(need, NUM_NODES)))
+
+        # Begin soft reservation earlier so agents can drain before the hour-72 arrival.
+        if self._task_name == "p0_emergency" and 56.0 <= current_hour < 72.0:
+            return [0, 1, 2, 3]
+
+        return []
+
     def _do_schedule(
         self,
         job_id:  Optional[str],
@@ -474,75 +698,117 @@ class GpuSchedulerEnvironment(Environment):
         Returns:
             0.0 on successful placement, -0.1 on any validation failure.
         """
-        # --- Validate: job must be in the queue ---
-        queue_job = next((j for j in self._queue if j.job_id == job_id), None)
-        if queue_job is None:
-            self._last_action_result = (
-                f"INVALID: '{job_id}' not found in queue "
-                f"(may be running, completed, or not yet arrived)."
+        if job_id is None:
+            return self._schedule_invalidate(
+                "INVALID: SCHEDULE requires a job_id.",
+                ActionErrorCode.JOB_NOT_IN_QUEUE,
             )
-            return -0.1
+
+        job_id = job_id.strip().lower()
+
+        queue_job = next((j for j in self._queue if j.job_id.lower() == job_id), None)
+        if queue_job is None:
+            return self._schedule_invalidate(
+                f"INVALID: '{job_id}' not found in queue "
+                f"(may be running, completed, or not yet arrived).",
+                ActionErrorCode.JOB_NOT_IN_QUEUE,
+            )
 
         gpu_count    = queue_job.gpu_count
-        nodes_needed = (gpu_count + GPUS_PER_NODE - 1) // GPUS_PER_NODE  # ceiling division
+        nodes_needed = (gpu_count + GPUS_PER_NODE - 1) // GPUS_PER_NODE
+
+        rl_suggested: Optional[int] = None
+        if self._rl_optimizer is not None and nodes_needed == 1:
+            try:
+                import numpy as np
+            except ImportError:
+                np = None  # type: ignore
+
+            if np is None:
+                self._rl_optimizer_last_suggestion = None
+            else:
+                weights = self._rl_optimizer.get_current_weights()
+                scores = [
+                    self._rl_optimizer.compute_node_score(
+                        node_free_gpus=self._get_free_gpus(n),
+                        node_contention=self._node_gpu_used[n] / GPUS_PER_NODE,
+                        job_priority=queue_job.priority,
+                        job_progress=queue_job.progress,
+                        weights=weights,
+                    )
+                    for n in range(NUM_NODES)
+                ]
+                rl_suggested = int(np.argmax(scores))
+                self._rl_optimizer_last_suggestion = rl_suggested
+        else:
+            self._rl_optimizer_last_suggestion = None
 
         if nodes_needed == 1:
-            # ---- Single-node placement ----
             if node_id is None or node_id not in range(NUM_NODES):
-                self._last_action_result = (
-                    f"INVALID: node_id {node_id} is out of range. Must be 0–7."
+                return self._schedule_invalidate(
+                    f"INVALID: node_id {node_id} is out of range. Must be 0–7.",
+                    ActionErrorCode.INVALID_NODE_ID,
                 )
-                return -0.1
 
             if self._get_free_gpus(node_id) < gpu_count:
-                self._last_action_result = (
+                hint = self._nodes_with_capacity(gpu_count)
+                extra = ""
+                if rl_suggested is not None and rl_suggested != node_id:
+                    extra = f" RL-weight hint: try node {rl_suggested}."
+                return self._schedule_invalidate(
                     f"INVALID: node {node_id} has {self._get_free_gpus(node_id)} "
-                    f"free GPUs but '{job_id}' needs {gpu_count}."
+                    f"free GPUs but '{job_id}' needs {gpu_count}. "
+                    f"Try nodes with capacity: {hint}.{extra}",
+                    ActionErrorCode.INSUFFICIENT_GPUS,
                 )
-                return -0.1
 
-            # Allocate GPUs and record placement
-            self._node_gpu_used[node_id] += gpu_count
-            self._node_jobs[node_id].append(job_id)
-            assigned_nodes = [node_id]
+            place_node = node_id
+            self._node_gpu_used[place_node] += gpu_count
+            self._node_jobs[place_node].append(queue_job.job_id)
+            assigned_nodes = [place_node]
 
         else:
-            # ---- Gang-scheduled multi-node placement ----
-            # Each assigned node must contribute all 8 GPUs to the job
             fully_free = [
                 n for n in range(NUM_NODES)
                 if self._get_free_gpus(n) == GPUS_PER_NODE
             ]
 
             if len(fully_free) < nodes_needed:
-                self._last_action_result = (
+                ok, reason = ResourceManager.check_gang_feasibility(
+                    gpu_count,
+                    self._node_gpu_used,
+                    list(self._active_jobs.values()),
+                    GPUS_PER_NODE,
+                    NUM_NODES,
+                )
+                feas = "may clear soon" if ok else "unlikely without PREEMPT/WAIT"
+                return self._schedule_invalidate(
                     f"INVALID: '{job_id}' [{queue_job.priority_label}] needs "
                     f"{nodes_needed} fully-free nodes ({gpu_count} GPUs total). "
-                    f"Only {len(fully_free)} fully-free node(s) available right now. "
-                    f"WAIT for running jobs to finish, or PREEMPT lower-priority jobs."
+                    f"Only {len(fully_free)} fully-free now. {reason} ({feas}).",
+                    ActionErrorCode.GANG_INSUFFICIENT_NODES,
                 )
-                return -0.1
 
-            # Honour the agent's preferred anchor node if it is free
             if node_id is not None and node_id in fully_free:
-                fully_free.remove(node_id)
-                selected = [node_id] + fully_free[:nodes_needed - 1]
+                pool = [n for n in fully_free if n != node_id]
+                selected = [node_id] + pool[: nodes_needed - 1]
             else:
                 selected = fully_free[:nodes_needed]
 
             assigned_nodes = selected
             for n in assigned_nodes:
-                self._node_gpu_used[n] += GPUS_PER_NODE   # full node consumed
-                self._node_jobs[n].append(job_id)
+                self._node_gpu_used[n] += GPUS_PER_NODE
+                self._node_jobs[n].append(queue_job.job_id)
 
-        # --- Move job: queue → active ---
-        self._queue = [j for j in self._queue if j.job_id != job_id]
-        queue_job.status         = "running"
+        jid_canon = queue_job.job_id
+        self._queue = [j for j in self._queue if j.job_id != jid_canon]
+        queue_job.status = "running"
         queue_job.assigned_nodes = assigned_nodes
-        self._active_jobs[job_id] = queue_job
+        self._active_jobs[jid_canon] = queue_job
 
+        self._last_action_error_code = None
         self._last_action_result = (
-            f"Scheduled '{job_id}' [{queue_job.priority_label}] "
+            f"Scheduled '{jid_canon}' [{queue_job.priority_label}] "
             f"on node(s) {assigned_nodes} ({gpu_count} GPUs)."
         )
         return 0.0
@@ -568,11 +834,20 @@ class GpuSchedulerEnvironment(Environment):
         Returns:
             Large negative float (burn penalty), or -0.1/-0.5 for invalid actions.
         """
+        if job_id is None:
+            self._last_action_result = "INVALID: PREEMPT requires a job_id."
+            self._last_action_error_code = ActionErrorCode.PREEMPT_JOB_NOT_RUNNING
+            self._invalid_action_count += 1
+            return -0.1
+
+        job_id = job_id.strip().lower()
         job = self._active_jobs.get(job_id)
         if job is None:
             self._last_action_result = (
                 f"INVALID: '{job_id}' is not currently running."
             )
+            self._last_action_error_code = ActionErrorCode.PREEMPT_JOB_NOT_RUNNING
+            self._invalid_action_count += 1
             return -0.1
 
         if job.priority == 0:
@@ -581,6 +856,8 @@ class GpuSchedulerEnvironment(Environment):
                 f"INVALID: P0 job '{job_id}' is non-preemptible. "
                 f"Wait for lower-priority jobs to finish naturally."
             )
+            self._last_action_error_code = ActionErrorCode.PREEMPT_P0_FORBIDDEN
+            self._invalid_action_count += 1
             return -0.5    # elevated penalty for even attempting this
 
         # --- Burn penalty: cost of all wasted GPU-hours ---
@@ -612,6 +889,7 @@ class GpuSchedulerEnvironment(Environment):
         del self._active_jobs[job_id]
         self._preempted_jobs.append(job)
 
+        self._last_action_error_code = None
         self._last_action_result = (
             f"PREEMPTED '{job_id}' [{job.priority_label}] — "
             f"burn ${burn_penalty / REWARD_SCALE:,.0f} | "
@@ -692,7 +970,7 @@ class GpuSchedulerEnvironment(Environment):
                 self._sla_jobs_met += 1
 
             # Track the special P0 emergency job for the hard-task grader
-            if job_id == "job_P0_EMERGENCY":
+            if job_id == "job_p0_emergency":
                 self._p0_job_completed = True
 
         # 3. Advance the simulation clock -----------------------------------------
@@ -713,6 +991,8 @@ class GpuSchedulerEnvironment(Environment):
 
         # 5. Release newly-arrived jobs into the visible queue --------------------
         self._release_arriving_jobs(from_hour=old_hour, to_hour=self._current_hour)
+        self._sort_queue_by_priority()
+        self._p0_reserved_nodes = self._reserve_for_p0_emergency(self._current_hour)
 
         # 6a. Queue-delay penalty for high-priority jobs left waiting -------------
         for job in self._queue:
@@ -927,6 +1207,11 @@ class GpuSchedulerEnvironment(Environment):
         ]
 
         # --- Metadata: always include episode stats; inject score when terminal ---
+        fully_free_nodes = sum(
+            1 for n in range(NUM_NODES) if self._get_free_gpus(n) == GPUS_PER_NODE
+        )
+        upcoming_p0 = self._upcoming_p0_job_ids(lookahead_hours=8.0)
+
         meta: Dict[str, Any] = {
             "step_count":     self._state.step_count,
             "jobs_spawned":   self._total_jobs_spawned,
@@ -934,13 +1219,29 @@ class GpuSchedulerEnvironment(Environment):
             "jobs_preempted": len(self._preempted_jobs),
             "sla_met":        self._sla_jobs_met,
             "sla_total":      self._sla_jobs_total,
+            "p0_reserved_nodes": list(self._p0_reserved_nodes),
+            "invalid_actions": self._invalid_action_count,
         }
+        if self._rl_optimizer_last_suggestion is not None:
+            meta["rl_suggested_node"] = self._rl_optimizer_last_suggestion
         # Terminal score: populate the observation-level score field so it
         # survives OpenEnv's serialize_observation (which strips metadata).
         terminal_score: Optional[float] = None
         if done:
             terminal_score     = self._compute_grader_score()
             meta["score"]      = terminal_score   # also in metadata for completeness
+            util = self._cumulative_gpu_hrs_used / max(self._cumulative_gpu_hrs_avail, 1.0)
+            sla_rate = self._sla_jobs_met / max(self._sla_jobs_total, 1)
+            meta["episode_metrics"] = {
+                "score": float(terminal_score),
+                "utilization": float(util),
+                "sla_rate": float(sla_rate),
+                "p0_completed": bool(self._p0_job_completed),
+                "invalid_actions": int(self._invalid_action_count),
+                "task_name": self._task_name,
+            }
+            if self._rl_optimizer is not None:
+                self._rl_optimizer.update(meta["episode_metrics"])
 
         return GpuSchedulerObservation(
             cluster_grid        = grid,
@@ -952,6 +1253,9 @@ class GpuSchedulerEnvironment(Environment):
             compute_burn_so_far = round(self._compute_burn_usd, 2),
             task_name           = self._task_name,
             last_action_result  = self._last_action_result,
+            last_action_error_code = self._last_action_error_code,
+            fully_free_nodes_count = fully_free_nodes,
+            upcoming_p0_jobs    = upcoming_p0,
             done                = done,
             reward              = reward,
             metadata            = meta,

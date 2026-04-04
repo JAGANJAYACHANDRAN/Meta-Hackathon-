@@ -22,11 +22,12 @@ from .client import GpuSchedulerEnv
 
 # models.py — all typed Pydantic models for actions and observations
 from .models import (
+    ActionErrorCode,
+    ActionType,
     GpuSchedulerAction,
     GpuSchedulerObservation,
     JobInfo,
     NodeInfo,
-    ActionType,
 )
 
 __all__ = [
@@ -36,4 +37,5 @@ __all__ = [
     "JobInfo",
     "NodeInfo",
     "ActionType",
+    "ActionErrorCode",
 ]

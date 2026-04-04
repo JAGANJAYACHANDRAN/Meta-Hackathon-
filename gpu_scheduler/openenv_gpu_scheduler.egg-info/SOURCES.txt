@@ -6,8 +6,11 @@ models.py
 pyproject.toml
 ./__init__.py
 ./client.py
+./demo_rich_logger.py
 ./inference.py
 ./models.py
+./rich_logger.py
+./rl_scheduler_optimizer.py
 openenv_gpu_scheduler.egg-info/PKG-INFO
 openenv_gpu_scheduler.egg-info/SOURCES.txt
 openenv_gpu_scheduler.egg-info/dependency_links.txt
@@ -17,3 +20,4 @@ openenv_gpu_scheduler.egg-info/top_level.txt
 server/__init__.py
 server/app.py
 server/gpu_scheduler_environment.py
+tests/test_scheduler_improvements.py

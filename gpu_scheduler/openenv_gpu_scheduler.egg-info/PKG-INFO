@@ -4,6 +4,11 @@ Version: 0.1.0
 Summary: Gpu Scheduler environment for OpenEnv
 Requires-Python: >=3.10
 Requires-Dist: openenv-core[core]>=0.2.2
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: rich>=13.0.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0.0; extra == "dev"
 Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
+Provides-Extra: rl
+Requires-Dist: numpy>=1.24.0; extra == "rl"
+Requires-Dist: scipy>=1.10.0; extra == "rl"

@@ -19,6 +19,7 @@ dependencies = [
     # "openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git",
     "openenv-core[core]>=0.2.2",
     "python-dotenv>=1.0.0",
+    "rich>=13.0.0",  # For enhanced logging output
     # Environment-specific dependencies
     # Add all dependencies needed for your environment here
     # Examples:
@@ -33,6 +34,10 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.0.0",
+]
+rl = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
 ]
 
 [project.scripts]
