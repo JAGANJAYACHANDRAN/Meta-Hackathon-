@@ -283,19 +283,29 @@ class GpuSchedulerEnvironment(Environment):
     # OpenEnv interface — reset / step / state
     # ------------------------------------------------------------------
 
-    def reset(self) -> GpuSchedulerObservation:
+    def reset(self, task_name: Optional[str] = None) -> GpuSchedulerObservation:
         """
-        Start a fresh episode for the task named in GPU_SCHEDULER_TASK env var.
+        Start a fresh episode for the specified task.
 
-        Reads and validates the task name, loads its configuration, seeds the RNG,
-        pre-generates the complete job arrival schedule, releases any hour-0 jobs
-        into the visible queue, and returns the initial observation.
+        Task resolution order (first non-None wins):
+          1. task_name kwarg  — passed directly by inference.py via env.reset(task_name=...)
+          2. GPU_SCHEDULER_TASK env var — fallback for local direct-server usage
+          3. "smooth_sailing" — safe default
+
+        Loads the task configuration, seeds the RNG, pre-generates the complete
+        job arrival schedule, releases any hour-0 jobs into the visible queue,
+        and returns the initial observation.
+
+        Args:
+            task_name: One of 'smooth_sailing', 'deadline_crunch', 'p0_emergency'.
+                       If None, falls back to GPU_SCHEDULER_TASK env var or default.
 
         Returns:
             GpuSchedulerObservation of an empty cluster with hour-0 jobs in queue.
         """
-        # inference.py sets this env var before calling reset() for each task
-        task_name = os.getenv("GPU_SCHEDULER_TASK", "smooth_sailing")
+        # Resolve task: kwarg > env var > default
+        if task_name is None:
+            task_name = os.getenv("GPU_SCHEDULER_TASK", "smooth_sailing")
         if task_name not in TASK_CONFIGS:
             task_name = "smooth_sailing"    # safe fallback
 
@@ -925,9 +935,12 @@ class GpuSchedulerEnvironment(Environment):
             "sla_met":        self._sla_jobs_met,
             "sla_total":      self._sla_jobs_total,
         }
+        # Terminal score: populate the observation-level score field so it
+        # survives OpenEnv's serialize_observation (which strips metadata).
+        terminal_score: Optional[float] = None
         if done:
-            # inference.py reads result.info["score"] to report the grader result
-            meta["score"] = self._compute_grader_score()
+            terminal_score     = self._compute_grader_score()
+            meta["score"]      = terminal_score   # also in metadata for completeness
 
         return GpuSchedulerObservation(
             cluster_grid        = grid,
@@ -942,4 +955,5 @@ class GpuSchedulerEnvironment(Environment):
             done                = done,
             reward              = reward,
             metadata            = meta,
+            score               = terminal_score,
         )

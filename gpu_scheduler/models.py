@@ -289,3 +289,12 @@ class GpuSchedulerObservation(Observation):
             "'INVALID: node 5 has only 2 free GPUs but job needs 4'."
         ),
     )
+    score: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Normalised grader score in [0.0, 1.0] — only populated when done=True. "
+            "None at all intermediate steps. Used by inference.py to report episode result."
+        ),
+    )

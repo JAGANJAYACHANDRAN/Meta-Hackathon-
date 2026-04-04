@@ -405,9 +405,8 @@ async def run_task(
     log_start(task=task_name, env_name=BENCHMARK, model=MODEL_NAME)
 
     try:
-        # Tell the environment which task to set up on reset
-        os.environ["GPU_SCHEDULER_TASK"] = task_name
-        result = await env.reset()
+        # Pass task_name directly so it works inside Docker containers too
+        result = await env.reset(task_name=task_name)
         obs: GpuSchedulerObservation = result.observation
 
         for step in range(1, max_steps + 1):
@@ -444,11 +443,12 @@ async def run_task(
             if done:
                 break
 
-        # --- Extract grader score from terminal step info ---
+        # --- Extract grader score from terminal observation ---
         # The environment's task grader computes a normalised 0.0–1.0 score
-        # and stores it in result.info when done=True.
-        info  = getattr(result, "info", {}) or {}
-        score = float(info.get("score", 0.0))
+        # and stores it in observation.score when done=True (serialised as a
+        # plain observation field so it survives OpenEnv's serialize_observation).
+        raw_score = getattr(result.observation, "score", None)
+        score = float(raw_score) if raw_score is not None else 0.0
         score = max(0.0, min(score, 1.0))   # safety clamp to [0, 1]
 
         success = score >= success_threshold

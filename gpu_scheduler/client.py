@@ -115,6 +115,8 @@ class GpuSchedulerEnv(
             compute_burn_so_far=obs_data.get("compute_burn_so_far", 0.0),
             task_name=obs_data.get("task_name", "unknown"),
             last_action_result=obs_data.get("last_action_result", ""),
+            # score field: populated by the environment when done=True
+            score=obs_data.get("score"),
             done=payload.get("done", False),
             reward=payload.get("reward", 0.0),
             metadata=obs_data.get("metadata", {}),

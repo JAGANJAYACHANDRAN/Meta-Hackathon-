@@ -1,0 +1,2 @@
+[console_scripts]
+server = gpu_scheduler.server.app:main
