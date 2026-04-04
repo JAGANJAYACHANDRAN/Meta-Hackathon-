@@ -46,9 +46,15 @@ import asyncio
 import os
 import re
 import textwrap
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from dotenv import load_dotenv
 from openai import OpenAI
+
+# Load .env file from the project root (same directory as this script)
+_env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(_env_path)
 
 # Import typed client + models from the gpu_scheduler package
 from gpu_scheduler import (
@@ -58,9 +64,9 @@ from gpu_scheduler import (
 )
 
 # ---------------------------------------------------------------------------
-# Environment variables — all sensitive config read from shell, never hardcoded
+# Environment variables — loaded from .env file or shell environment
 # ---------------------------------------------------------------------------
-IMAGE_NAME   = os.getenv("IMAGE_NAME")          # Docker image for the env server
+IMAGE_NAME   = os.getenv("IMAGE_NAME")          # HF Space URL or Docker image
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
@@ -480,8 +486,11 @@ async def main() -> None:
     """
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    # from_docker_image() starts the container, waits for /health, returns client
-    env = await GpuSchedulerEnv.from_docker_image(IMAGE_NAME)
+    # If IMAGE_NAME looks like a URL, connect directly; otherwise use Docker
+    if IMAGE_NAME and IMAGE_NAME.startswith("http"):
+        env = GpuSchedulerEnv(base_url=IMAGE_NAME)
+    else:
+        env = await GpuSchedulerEnv.from_docker_image(IMAGE_NAME)
 
     try:
         results: Dict[str, bool] = {}
