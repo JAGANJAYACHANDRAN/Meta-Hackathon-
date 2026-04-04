@@ -5,3 +5,143 @@ runtime: fastapi
 app: server.app:app
 port: 8000
 
+# ---------------------------------------------------------------------------
+# Environment metadata
+# ---------------------------------------------------------------------------
+display_name: "GPUScheduler-Env"
+version: "0.1.0"
+description: >
+  A high-fidelity simulation of an enterprise GPU cluster (8 nodes × 8 GPUs,
+  $100,000/day operating cost) where an AI agent learns to minimise "compute burn"
+  through intelligent job scheduling. The agent must balance GPU utilisation,
+  SLA compliance, preemption costs, and memory contention across three tasks of
+  escalating difficulty — including a 32-GPU gang-scheduled P0 emergency that
+  requires proactive resource reservation.
+
+author: "GPUScheduler Team"
+tags:
+  - openenv
+  - scheduling
+  - resource-management
+  - reinforcement-learning
+  - llm-agent
+  - cluster-management
+
+# ---------------------------------------------------------------------------
+# Action space
+# ---------------------------------------------------------------------------
+action:
+  type: object
+  description: "Discrete scheduling decision issued by the agent each step."
+  properties:
+    action_type:
+      type: string
+      enum: [SCHEDULE, PREEMPT, WAIT]
+      description: >
+        SCHEDULE — place a queued job on a node.
+        PREEMPT  — evict a running job (large burn penalty).
+        WAIT     — advance the clock without scheduling.
+    job_id:
+      type: string
+      description: "Job identifier (required for SCHEDULE and PREEMPT)."
+      nullable: true
+    node_id:
+      type: integer
+      minimum: 0
+      maximum: 7
+      description: "Target node index 0–7 (required for SCHEDULE)."
+      nullable: true
+  required:
+    - action_type
+
+# ---------------------------------------------------------------------------
+# Observation space
+# ---------------------------------------------------------------------------
+observation:
+  type: object
+  description: "Full cluster state delivered to the agent after each step."
+  properties:
+    cluster_grid:
+      type: array
+      description: "8×8 matrix. Cell value = job index in active_jobs (-1 = free GPU)."
+    nodes:
+      type: array
+      description: "Per-node snapshot: used/free GPUs and memory contention level."
+    active_jobs:
+      type: array
+      description: "All currently running jobs with progress, priority, and assigned nodes."
+    queue:
+      type: array
+      description: "Jobs waiting to be scheduled (includes ~4h lookahead of arrivals)."
+    current_hour:
+      type: number
+      description: "Simulated wall-clock hours elapsed since episode start."
+    total_hours:
+      type: number
+      description: "Total episode duration (24 / 72 / 168 hours by task)."
+    compute_burn_so_far:
+      type: number
+      description: "Cumulative cluster operating cost in USD this episode."
+    task_name:
+      type: string
+      description: "Active task: smooth_sailing | deadline_crunch | p0_emergency"
+    last_action_result:
+      type: string
+      description: "Plain-English feedback on the agent's last action (errors included)."
+
+# ---------------------------------------------------------------------------
+# Tasks — each defines a distinct episode with its own grader
+# ---------------------------------------------------------------------------
+tasks:
+
+  - name: smooth_sailing
+    difficulty: easy
+    description: >
+      A calm 24-hour window with low-demand P2/P3 jobs and no deadlines.
+      The agent must keep GPUs occupied by efficiently scheduling from the queue.
+      Grader score: 60% job completion rate + 40% GPU utilisation.
+    episode_length: 24        # simulated hours
+    agent_steps: 24           # 1 h/step
+    success_threshold: 0.40
+    seed: 42
+
+  - name: deadline_crunch
+    difficulty: medium
+    description: >
+      A 72-hour window with ~28 P1/P2 jobs, 75% of which carry tight SLA deadlines.
+      The agent must juggle deadline-aware prioritisation alongside utilisation.
+      Preemption is available but costly. Grader score: 60% SLA compliance + 40% completion rate.
+    episode_length: 72        # simulated hours
+    agent_steps: 36           # 2 h/step
+    success_threshold: 0.35
+    seed: 137
+
+  - name: p0_emergency
+    difficulty: hard
+    description: >
+      A 168-hour (one-week) simulation. At hour 72, a 32-GPU P0 gang job arrives
+      with a 60-hour deadline — requiring 4 fully-free nodes simultaneously.
+      The agent must proactively reserve cluster space before the emergency arrives,
+      because preemption costs 10× the remaining compute value.
+      Grader score: 50% P0 job completed + 30% SLA compliance + 20% utilisation.
+    episode_length: 168       # simulated hours
+    agent_steps: 42           # 4 h/step
+    success_threshold: 0.30
+    seed: 999
+
+# ---------------------------------------------------------------------------
+# Environment variables required at runtime
+# ---------------------------------------------------------------------------
+env_vars:
+  GPU_SCHEDULER_TASK:
+    description: "Which task to run on reset(). Set by inference.py before each episode."
+    default: "smooth_sailing"
+    required: false
+
+# ---------------------------------------------------------------------------
+# Infrastructure constraints
+# ---------------------------------------------------------------------------
+resources:
+  min_vcpu: 1
+  min_memory_gb: 1
+  max_inference_runtime_minutes: 20

@@ -11,245 +11,220 @@ tags:
   - openenv
 ---
 
-# Gpu Scheduler Environment
+# GPUScheduler-Env
 
-A simple test environment that echoes back messages. Perfect for testing the env APIs as well as demonstrating environment usage patterns.
+**A high-fidelity RL environment for AI-driven GPU cluster orchestration.**
+
+An AI agent manages an 8-node × 8-GPU enterprise cluster running at **$100,000/day**. Every decision — schedule, preempt, or wait — has a direct financial consequence. The agent must learn to minimise "compute burn" across three tasks of escalating difficulty, culminating in a week-long simulation where a 32-GPU P0 emergency arrives mid-run requiring proactively reserved space.
+
+---
+
+## The Problem
+
+Modern GPU clusters are expensive and chaotic. Jobs arrive unpredictably, carry different priorities and deadlines, and compete for shared hardware. Naive schedulers waste millions in idle GPU time. Human operators can't react fast enough at scale.
+
+GPUScheduler-Env gives an RL agent the same information a real cluster orchestrator sees — queue depth, node utilisation, contention metrics, SLA deadlines — and forces it to develop long-horizon strategies under genuine economic pressure.
+
+---
+
+## Cluster Layout
+
+```
+8 nodes  ×  8 GPUs  =  64 GPUs total
+Cost: $100,000/day  ≈  $4,167/hour  ≈  $65/GPU/hour
+```
+
+Each node exposes a **memory contention** metric. When GPU utilisation exceeds 70%, all jobs on that node slow down — up to 50% degradation at full saturation. Packing too many jobs onto one node is a trap.
+
+---
+
+## Action Space
+
+| Action | Parameters | Description |
+|---|---|---|
+| `SCHEDULE` | `job_id`, `node_id` | Place a queued job on a node (0–7). Jobs needing >8 GPUs auto-span multiple fully-free nodes. |
+| `PREEMPT` | `job_id` | Evict a running job. Costs 10× remaining compute value + 1h checkpoint rollback. |
+| `WAIT` | — | Advance the simulation clock without scheduling. |
+
+```json
+{ "action_type": "SCHEDULE", "job_id": "job_042", "node_id": 3 }
+{ "action_type": "PREEMPT",  "job_id": "job_017" }
+{ "action_type": "WAIT" }
+```
+
+---
+
+## Observation Space
+
+| Field | Type | Description |
+|---|---|---|
+| `cluster_grid` | `int[8][8]` | GPU occupancy map. −1 = free, else = index into `active_jobs`. |
+| `nodes` | `NodeInfo[8]` | Per-node: used/free GPUs, memory contention (0.0–1.0), running job IDs. |
+| `active_jobs` | `JobInfo[]` | All running jobs: priority, GPU count, progress %, assigned nodes, deadline. |
+| `queue` | `JobInfo[]` | Jobs waiting to be scheduled, with ~4-hour arrival lookahead. |
+| `current_hour` | `float` | Simulated hours elapsed this episode. |
+| `total_hours` | `float` | Episode horizon (24 / 72 / 168 hours). |
+| `compute_burn_so_far` | `float` | Cumulative USD cost this episode. |
+| `task_name` | `string` | Active task: `smooth_sailing` \| `deadline_crunch` \| `p0_emergency` |
+| `last_action_result` | `string` | Plain-English feedback on the previous action (errors included). |
+
+---
+
+## Reward Function
+
+Reward is continuous — computed every step, not only at episode end.
+
+```
+Reward_t = R_progress + R_cost − (R_preemption + R_sla + R_queue)
+```
+
+| Component | Type | Formula |
+|---|---|---|
+| **Progress** | Positive | `Σ (Δprogress_j × priority_weight_j)` per running job |
+| **Idle cost** | Negative | `idle_gpus × hours × hourly_rate × 0.3` |
+| **Preemption burn** | Negative | `gpu_count × remaining_hours × hourly_rate × 10` |
+| **SLA violation** | Negative | `gpu_count × duration × hourly_rate × 5` (one-time on breach) |
+| **Queue delay** | Negative | Small per-hour penalty for P0/P1 jobs waiting in queue |
+
+---
+
+## Tasks
+
+### Easy — `smooth_sailing` (24h, 24 steps at 1h/step)
+Low-demand window with 12 small P2/P3 jobs, no deadlines. Keep GPUs occupied.
+**Grader:** `0.6 × completion_rate + 0.4 × gpu_utilisation`
+
+### Medium — `deadline_crunch` (72h, 36 steps at 2h/step)
+~28 mixed P1/P2 jobs, 75% with tight SLA deadlines. Prioritise time-sensitive work.
+**Grader:** `0.6 × sla_compliance + 0.4 × completion_rate`
+
+### Hard — `p0_emergency` (168h, 42 steps at 4h/step)
+One week of mixed load. At **hour 72**, a **32-GPU P0 gang job** arrives with a 60-hour deadline — requiring 4 fully-free nodes. The agent must drain nodes proactively; preempting costs 10× remaining value.
+**Grader:** `0.5 × p0_completed + 0.3 × sla_compliance + 0.2 × gpu_utilisation`
+
+---
+
+## Real-World Tensions
+
+**Preemption burn** — stopping a job wastes all compute since the last checkpoint. The penalty is 10× remaining runtime cost.
+
+**Memory contention** — colocating too many jobs on one node degrades all of them. Spread load even when packing looks locally optimal.
+
+**Gang scheduling** — the 32-GPU P0 job needs 4 *fully* free nodes. Cannot scatter across partially-occupied nodes. Requires look-ahead planning across dozens of steps.
+
+**Checkpoint loss** — preempted jobs lose up to 1 hour of progress on rollback.
+
+---
 
 ## Quick Start
 
-The simplest way to use the Gpu Scheduler environment is through the `GpuSchedulerEnv` class:
+```bash
+# Install
+cd gpu_scheduler
+pip install openenv-core
 
-```python
-from gpu_scheduler import GpuSchedulerAction, GpuSchedulerEnv
+# Start server
+uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
 
-try:
-    # Create environment from Docker image
-    gpu_schedulerenv = GpuSchedulerEnv.from_docker_image("gpu_scheduler-env:latest")
-
-    # Reset
-    result = gpu_schedulerenv.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-
-    # Send multiple messages
-    messages = ["Hello, World!", "Testing echo", "Final message"]
-
-    for msg in messages:
-        result = gpu_schedulerenv.step(GpuSchedulerAction(message=msg))
-        print(f"Sent: '{msg}'")
-        print(f"  → Echoed: '{result.observation.echoed_message}'")
-        print(f"  → Length: {result.observation.message_length}")
-        print(f"  → Reward: {result.reward}")
-
-finally:
-    # Always clean up
-    gpu_schedulerenv.close()
+# Run baseline inference agent
+IMAGE_NAME=gpu_scheduler-env:latest \
+HF_TOKEN=hf_... \
+python inference.py
 ```
 
-That's it! The `GpuSchedulerEnv.from_docker_image()` method handles:
-- Starting the Docker container
-- Waiting for the server to be ready
-- Connecting to the environment
-- Container cleanup when you call `close()`
-
-## Building the Docker Image
-
-Before using the environment, you need to build the Docker image:
+### Docker
 
 ```bash
-# From project root
-docker build -t gpu_scheduler-env:latest -f server/Dockerfile .
+cd gpu_scheduler/server
+docker build -t gpu_scheduler-env:latest .
+docker run -p 8000:8000 gpu_scheduler-env:latest
 ```
 
-## Deploying to Hugging Face Spaces
-
-You can easily deploy your OpenEnv environment to Hugging Face Spaces using the `openenv push` command:
+### Validate
 
 ```bash
-# From the environment directory (where openenv.yaml is located)
-openenv push
-
-# Or specify options
-openenv push --namespace my-org --private
+pip install openenv-core
+openenv validate
 ```
 
-The `openenv push` command will:
-1. Validate that the directory is an OpenEnv environment (checks for `openenv.yaml`)
-2. Prepare a custom build for Hugging Face Docker space (enables web interface)
-3. Upload to Hugging Face (ensuring you're logged in)
+---
 
-### Prerequisites
+## Inference Script
 
-- Authenticate with Hugging Face: The command will prompt for login if not already authenticated
+The baseline `inference.py` runs an LLM agent against all three tasks sequentially.
 
-### Options
+**Required environment variables:**
 
-- `--directory`, `-d`: Directory containing the OpenEnv environment (defaults to current directory)
-- `--repo-id`, `-r`: Repository ID in format 'username/repo-name' (defaults to 'username/env-name' from openenv.yaml)
-- `--base-image`, `-b`: Base Docker image to use (overrides Dockerfile FROM)
-- `--private`: Deploy the space as private (default: public)
+| Variable | Description |
+|---|---|
+| `HF_TOKEN` | HuggingFace / API key |
+| `IMAGE_NAME` | Docker image tag for the environment server |
+| `API_BASE_URL` | LLM endpoint (default: HuggingFace router) |
+| `MODEL_NAME` | Model identifier (default: `Qwen/Qwen2.5-72B-Instruct`) |
 
-### Examples
+**Expected stdout:**
+```
+[START] task=smooth_sailing env=gpu_scheduler model=Qwen/Qwen2.5-72B-Instruct
+[STEP] step=1 action=SCHEDULE job_003 0 reward=0.12 done=false error=null
+...
+[END] success=true steps=24 score=0.621 rewards=0.12,0.18,...
+
+[START] task=deadline_crunch env=gpu_scheduler model=Qwen/Qwen2.5-72B-Instruct
+...
+[END] success=true steps=36 score=0.487 rewards=...
+
+[START] task=p0_emergency env=gpu_scheduler model=Qwen/Qwen2.5-72B-Instruct
+...
+[END] success=false steps=42 score=0.284 rewards=...
+```
+
+---
+
+## Baseline Scores
+
+| Task | Score | Notes |
+|---|---|---|
+| `smooth_sailing` | ~0.60 | Greedy scheduling, good utilisation |
+| `deadline_crunch` | ~0.45 | Misses ~30% of deadlines |
+| `p0_emergency` | ~0.28 | Often fails to reserve space before hour 72 |
+
+---
+
+## Deploy to Hugging Face Spaces
 
 ```bash
-# Push to your personal namespace (defaults to username/env-name from openenv.yaml)
-openenv push
-
-# Push to a specific repository
-openenv push --repo-id my-org/my-env
-
-# Push with a custom base image
-openenv push --base-image ghcr.io/meta-pytorch/openenv-base:latest
-
-# Push as a private space
-openenv push --private
-
-# Combine options
-openenv push --repo-id my-org/my-env --base-image custom-base:latest --private
+# From the gpu_scheduler directory
+openenv push --repo-id your-username/gpu-scheduler-env
 ```
 
-After deployment, your space will be available at:
-`https://huggingface.co/spaces/<repo-id>`
+The deployed Space exposes:
+- **Web UI** at `/web` — interactive cluster visualiser
+- **API docs** at `/docs` — full OpenAPI interface
+- **Health check** at `/health`
+- **WebSocket** at `/ws` — persistent session endpoint
 
-The deployed space includes:
-- **Web Interface** at `/web` - Interactive UI for exploring the environment
-- **API Documentation** at `/docs` - Full OpenAPI/Swagger interface
-- **Health Check** at `/health` - Container health monitoring
-- **WebSocket** at `/ws` - Persistent session endpoint for low-latency interactions
-
-## Environment Details
-
-### Action
-**GpuSchedulerAction**: Contains a single field
-- `message` (str) - The message to echo back
-
-### Observation
-**GpuSchedulerObservation**: Contains the echo response and metadata
-- `echoed_message` (str) - The message echoed back
-- `message_length` (int) - Length of the message
-- `reward` (float) - Reward based on message length (length × 0.1)
-- `done` (bool) - Always False for echo environment
-- `metadata` (dict) - Additional info like step count
-
-### Reward
-The reward is calculated as: `message_length × 0.1`
-- "Hi" → reward: 0.2
-- "Hello, World!" → reward: 1.3
-- Empty message → reward: 0.0
-
-## Advanced Usage
-
-### Connecting to an Existing Server
-
-If you already have a Gpu Scheduler environment server running, you can connect directly:
-
-```python
-from gpu_scheduler import GpuSchedulerEnv
-
-# Connect to existing server
-gpu_schedulerenv = GpuSchedulerEnv(base_url="<ENV_HTTP_URL_HERE>")
-
-# Use as normal
-result = gpu_schedulerenv.reset()
-result = gpu_schedulerenv.step(GpuSchedulerAction(message="Hello!"))
-```
-
-Note: When connecting to an existing server, `gpu_schedulerenv.close()` will NOT stop the server.
-
-### Using the Context Manager
-
-The client supports context manager usage for automatic connection management:
-
-```python
-from gpu_scheduler import GpuSchedulerAction, GpuSchedulerEnv
-
-# Connect with context manager (auto-connects and closes)
-with GpuSchedulerEnv(base_url="http://localhost:8000") as env:
-    result = env.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-    # Multiple steps with low latency
-    for msg in ["Hello", "World", "!"]:
-        result = env.step(GpuSchedulerAction(message=msg))
-        print(f"Echoed: {result.observation.echoed_message}")
-```
-
-The client uses WebSocket connections for:
-- **Lower latency**: No HTTP connection overhead per request
-- **Persistent session**: Server maintains your environment state
-- **Efficient for episodes**: Better for many sequential steps
-
-### Concurrent WebSocket Sessions
-
-The server supports multiple concurrent WebSocket connections. To enable this,
-modify `server/app.py` to use factory mode:
-
-```python
-# In server/app.py - use factory mode for concurrent sessions
-app = create_app(
-    GpuSchedulerEnvironment,  # Pass class, not instance
-    GpuSchedulerAction,
-    GpuSchedulerObservation,
-    max_concurrent_envs=4,  # Allow 4 concurrent sessions
-)
-```
-
-Then multiple clients can connect simultaneously:
-
-```python
-from gpu_scheduler import GpuSchedulerAction, GpuSchedulerEnv
-from concurrent.futures import ThreadPoolExecutor
-
-def run_episode(client_id: int):
-    with GpuSchedulerEnv(base_url="http://localhost:8000") as env:
-        result = env.reset()
-        for i in range(10):
-            result = env.step(GpuSchedulerAction(message=f"Client {client_id}, step {i}"))
-        return client_id, result.observation.message_length
-
-# Run 4 episodes concurrently
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(run_episode, range(4)))
-```
-
-## Development & Testing
-
-### Direct Environment Testing
-
-Test the environment logic directly without starting the HTTP server:
-
-```bash
-# From the server directory
-python3 server/gpu_scheduler_environment.py
-```
-
-This verifies that:
-- Environment resets correctly
-- Step executes actions properly
-- State tracking works
-- Rewards are calculated correctly
-
-### Running Locally
-
-Run the server locally for development:
-
-```bash
-uvicorn server.app:app --reload
-```
+---
 
 ## Project Structure
 
 ```
 gpu_scheduler/
-├── .dockerignore         # Docker build exclusions
-├── __init__.py            # Module exports
-├── README.md              # This file
-├── openenv.yaml           # OpenEnv manifest
-├── pyproject.toml         # Project metadata and dependencies
-├── uv.lock                # Locked dependencies (generated)
-├── client.py              # GpuSchedulerEnv client
-├── models.py              # Action and Observation models
+├── inference.py                      # LLM agent script (hackathon requirement)
+├── models.py                         # Typed Pydantic Action/Observation models
+├── client.py                         # WebSocket EnvClient
+├── __init__.py                       # Package surface
+├── openenv.yaml                      # OpenEnv spec + task definitions
+├── pyproject.toml
+├── README.md
 └── server/
-    ├── __init__.py        # Server module exports
-    ├── gpu_scheduler_environment.py  # Core environment logic
-    ├── app.py             # FastAPI application (HTTP + WebSocket endpoints)
-    └── Dockerfile         # Container image definition
+    ├── app.py                        # FastAPI server (HTTP + WebSocket)
+    ├── gpu_scheduler_environment.py  # Core simulation engine
+    ├── Dockerfile
+    └── requirements.txt
 ```
+
+---
+
+## Why This Matters
+
+GPU scheduling is a billion-dollar problem. Major cloud providers and ML labs spend enormous engineering effort on cluster orchestrators that are still largely rule-based. An RL agent that reasons about priorities, contention, and economic trade-offs over long horizons could meaningfully outperform hand-crafted heuristics — and this environment provides a rigorous testbed to develop and evaluate such agents.
