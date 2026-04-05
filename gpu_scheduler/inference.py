@@ -42,14 +42,23 @@ RUN
   IMAGE_NAME=gpu_scheduler-env:latest \\
   HF_TOKEN=hf_...                     \\
   python inference.py
+
+OPTIONAL LOG FILE (full stdout mirror for inspection)
+------------------------------------------------------
+  INFERENCE_LOG_FILE   — path to write every printed line (still prints to
+                         terminal). Set to off / false / 0 to disable.
+                         If unset, defaults to:
+                         gpu_scheduler/logs/inference_YYYYMMDD_HHMMSS.log
 """
 
 import asyncio
 import os
 import re
+import sys
 import textwrap
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, TextIO, Tuple
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -74,6 +83,68 @@ API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 BENCHMARK    = "gpu_scheduler"
+
+# Mirror stdout to a log file (see module docstring)
+_INFERENCE_LOG_FP: Optional[TextIO] = None
+_ORIG_STDOUT: Optional[TextIO] = None
+
+
+class _TeeStdout:
+    """Write to the real terminal and to an open log file."""
+
+    def __init__(self, terminal: TextIO, log_file: TextIO) -> None:
+        self._terminal = terminal
+        self._log_file = log_file
+
+    def write(self, s: str) -> int:
+        self._terminal.write(s)
+        self._log_file.write(s)
+        self._terminal.flush()
+        self._log_file.flush()
+        return len(s)
+
+    def flush(self) -> None:
+        self._terminal.flush()
+        self._log_file.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self._terminal, name)
+
+
+def _setup_inference_log_file() -> Optional[Path]:
+    """
+    Tee stdout to a log file. Returns the path written, or None if disabled.
+    """
+    global _INFERENCE_LOG_FP, _ORIG_STDOUT
+    raw = os.getenv("INFERENCE_LOG_FILE", "").strip().lower()
+    if raw in ("0", "false", "no", "off", "disable", "disabled"):
+        return None
+
+    script_dir = Path(__file__).resolve().parent
+    if raw:
+        log_path = Path(raw).expanduser()
+        if not log_path.is_absolute():
+            log_path = Path.cwd() / log_path
+    else:
+        log_dir = script_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"inference_{datetime.now():%Y%m%d_%H%M%S}.log"
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _INFERENCE_LOG_FP = open(log_path, "w", encoding="utf-8")
+    _ORIG_STDOUT = sys.stdout
+    sys.stdout = _TeeStdout(_ORIG_STDOUT, _INFERENCE_LOG_FP)
+    return log_path
+
+
+def _teardown_inference_log_file() -> None:
+    global _INFERENCE_LOG_FP, _ORIG_STDOUT
+    if _ORIG_STDOUT is not None:
+        sys.stdout = _ORIG_STDOUT
+        _ORIG_STDOUT = None
+    if _INFERENCE_LOG_FP is not None:
+        _INFERENCE_LOG_FP.close()
+        _INFERENCE_LOG_FP = None
 
 # ---------------------------------------------------------------------------
 # Task configuration
@@ -132,13 +203,25 @@ SYSTEM_PROMPT = textwrap.dedent("""
 
     CRITICAL RULES
     ---------------
-    1. SCHEDULE job_ids MUST come from the SCHEDULABLE JOBS list.
+    1. SCHEDULE job_ids MUST come from the SCHEDULABLE JOBS list — use ONLY
+       the EXACT IDs shown there (e.g. job_007). NEVER invent job IDs.
     2. PREEMPT job_ids MUST come from the RUNNING JOBS list.
     3. GIVE THE EXACT JOB ID WHEN SCHEDULING OR PREEMPTING.
     4. If SCHEDULABLE JOBS is empty and no preemptions needed, use WAIT.
     5. Never re-schedule an already-running job.
     6. Pick node_ids with enough free GPUs for the job's gpu_count.
     7. Never preempt P0 jobs.
+    8. PREEMPT is EXTREMELY EXPENSIVE. Only preempt when ALL of these are true:
+       a. A higher-priority job is in the queue that CANNOT fit on any node
+       b. No other way to free GPUs (no jobs finishing soon)
+       c. The preempted job is low-priority (P3 first, then P2)
+       NEVER preempt to "reshuffle" or "optimize". NEVER preempt a job you
+       just scheduled. Each preemption burns 2× the wasted work as penalty.
+    9. NEVER preempt and reschedule the same jobs back and forth. This creates
+       a loop that destroys your score. If you preempted a job, let it run
+       after rescheduling — do NOT preempt it again.
+    10. The TASK NAME is never a job_id. "p0_emergency", "smooth_sailing",
+        "deadline_crunch" are task names — they will NEVER appear in job lists.
 
     MULTI-ACTION BATCHING (ATOMIC)
     --------------------------------
@@ -337,21 +420,21 @@ def parse_single_action(line: str) -> Optional[GpuSchedulerAction]:
     if not line:
         return None
 
-    # SCHEDULE job_id node_id
-    m = re.match(r"SCHEDULE\s+(job_\d+)\s+(\d+)", line, re.IGNORECASE)
+    # SCHEDULE job_id node_id  (job_id can be job_NNN or job_P0_EMERGENCY etc.)
+    m = re.match(r"SCHEDULE\s+(job_\w+)\s+(\d+)", line, re.IGNORECASE)
     if m:
         return GpuSchedulerAction(
             action_type="SCHEDULE",
-            job_id=m.group(1).lower(),
+            job_id=m.group(1),
             node_id=int(m.group(2)),
         )
 
     # PREEMPT job_id
-    m = re.match(r"PREEMPT\s+(job_\d+)", line, re.IGNORECASE)
+    m = re.match(r"PREEMPT\s+(job_\w+)", line, re.IGNORECASE)
     if m:
         return GpuSchedulerAction(
             action_type="PREEMPT",
-            job_id=m.group(1).lower(),
+            job_id=m.group(1),
         )
 
     # WAIT
@@ -451,6 +534,7 @@ def validate_action(
 def validate_batch(
     actions: List[GpuSchedulerAction],
     obs: GpuSchedulerObservation,
+    recently_preempted: Optional[set] = None,
 ) -> List[GpuSchedulerAction]:
     """
     Pre-validate a batch of actions against the initial observation.
@@ -458,8 +542,14 @@ def validate_batch(
     Simulates GPU state changes across the batch so that sequential
     PREEMPT→SCHEDULE chains are validated correctly. Drops invalid
     actions but keeps the rest. Always returns at least [WAIT].
+
+    recently_preempted: set of job_ids preempted in the last N steps.
+    If a job was recently preempted, block re-preemption to prevent loops.
     """
     valid: List[GpuSchedulerAction] = []
+    if recently_preempted is None:
+        recently_preempted = set()
+
     # Track simulated GPU changes: node_id -> free_gpus
     free_gpus = {n.node_id: n.free_gpus for n in obs.nodes}
     scheduled_ids: set = set()  # jobs moved from queue to running in this batch
@@ -512,6 +602,9 @@ def validate_batch(
                 continue
             if jid in p0_ids:
                 continue
+            # Block preemption loops: don't re-preempt recently preempted jobs
+            if jid in recently_preempted:
+                continue
             # Accept and simulate freeing GPUs
             if jid in running_info:
                 gpu_count, nodes = running_info[jid]
@@ -533,7 +626,8 @@ def get_llm_actions(
     step: int,
     history: List[str],
     max_steps: int = 42,
-) -> Tuple[List[GpuSchedulerAction], str]:
+    recently_preempted: Optional[set] = None,
+) -> Tuple[List[GpuSchedulerAction], str, List[str]]:
     """
     Query the LLM for a batch of scheduling actions.
 
@@ -558,11 +652,12 @@ def get_llm_actions(
         f"STEP BUDGET: {steps_remaining} steps left | "
         f"each step advances clock by {hours_per_step:.0f}h\n\n"
         f"RECENT TRAJECTORY:\n{history_block}\n\n"
-        f"SCHEDULABLE job_ids: {schedulable or 'NONE'}\n"
+        f"SCHEDULABLE job_ids (ONLY these are valid for SCHEDULE): "
+        f"{schedulable or 'NONE — use WAIT'}\n"
         f"PREEMPTABLE job_ids (non-P0 running): {preemptable or 'NONE'}\n\n"
-        f"Respond in REASON + ACTIONS format. "
-        f"All actions in your batch execute atomically in ONE step. "
-        f"Batch all schedules/preempts that make sense together."
+        f"⚠ Use ONLY the exact job_ids listed above. "
+        f"PREEMPT only if a queued job cannot fit without freeing GPUs. "
+        f"Respond in REASON + ACTIONS format."
     )
 
     try:
@@ -578,17 +673,25 @@ def get_llm_actions(
         )
         raw = (completion.choices[0].message.content or "WAIT").strip()
         actions = parse_actions(raw)
-        actions = validate_batch(actions, obs)
+        proposed_strs = []
+        for a in actions:
+            if a.action_type == "SCHEDULE":
+                proposed_strs.append(f"SCHEDULE {a.job_id} {a.node_id}")
+            elif a.action_type == "PREEMPT":
+                proposed_strs.append(f"PREEMPT {a.job_id}")
+            else:
+                proposed_strs.append("WAIT")
+        actions = validate_batch(actions, obs, recently_preempted)
         # Cap batch size to avoid burning too many steps at once.
         # Leave at least 2 steps for the LLM to react to state changes.
         max_batch = max(1, steps_remaining - 2)
         if len(actions) > max_batch:
             actions = actions[:max_batch]
-        return actions, raw
+        return actions, raw, proposed_strs
 
     except Exception as exc:
         print(f"[DEBUG] LLM request failed at step {step}: {exc}", flush=True)
-        return [GpuSchedulerAction(action_type="WAIT")], "WAIT (api-error fallback)"
+        return [GpuSchedulerAction(action_type="WAIT")], "WAIT (api-error fallback)", []
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +887,10 @@ async def run_task(
     score:       float       = 0.0
     success:     bool        = False
     history:     List[str]   = []
+    # Track recently preempted jobs to prevent preempt-schedule-preempt loops.
+    # Maps job_id -> step_number when preempted. Expires after PREEMPT_COOLDOWN steps.
+    preempt_history: Dict[str, int] = {}
+    PREEMPT_COOLDOWN = 5  # blocks re-preemption for 5 steps
 
     log_start(task=task_name, env_name=BENCHMARK, model=MODEL_NAME)
 
@@ -795,12 +902,38 @@ async def run_task(
             if result.done:
                 break
 
+            # Build recently_preempted set (jobs within cooldown window)
+            recently_preempted = {
+                jid for jid, s in preempt_history.items()
+                if step - s <= PREEMPT_COOLDOWN
+            }
+
             # Get batch of actions from LLM
-            parsed_actions, raw_response = get_llm_actions(
-                client, obs, step, history, max_steps
+            parsed_actions, raw_response, proposed_strs = get_llm_actions(
+                client, obs, step, history, max_steps, recently_preempted
             )
 
-            # Build action strings for logging
+            # WAIT guard: if LLM wants to WAIT but there are schedulable jobs
+            # that fit on available nodes, auto-schedule the best one instead
+            if (
+                len(parsed_actions) == 1
+                and parsed_actions[0].action_type == "WAIT"
+                and obs.queue
+            ):
+                # Find best schedulable job that fits
+                for job in sorted(obs.queue, key=lambda j: (j.priority, -j.hours_in_queue)):
+                    best_node = max(obs.nodes, key=lambda n: n.free_gpus)
+                    needed = min(job.gpu_count, 8)
+                    if best_node.free_gpus >= needed:
+                        parsed_actions = [GpuSchedulerAction(
+                            action_type="SCHEDULE",
+                            job_id=job.job_id,
+                            node_id=best_node.node_id,
+                        )]
+                        raw_response += f"\n[AUTO-CORRECTED] WAIT→SCHEDULE {job.job_id} {best_node.node_id} (queue not empty)"
+                        break
+
+            # Build action strings for the validated+executed batch (for logging)
             batch_plan = []
             for a in parsed_actions:
                 if a.action_type == "SCHEDULE":
@@ -809,6 +942,9 @@ async def run_task(
                     batch_plan.append(f"PREEMPT {a.job_id}")
                 else:
                     batch_plan.append("WAIT")
+
+            # Detect actions the LLM proposed but were dropped as invalid
+            dropped = [s for s in proposed_strs if s not in batch_plan]
 
             # Convert to single env action (BATCH, single, or WAIT)
             action, action_str = _build_batch_action(parsed_actions)
@@ -848,11 +984,19 @@ async def run_task(
             print(_STEP_LOG_SEPARATOR, flush=True)
             print("\n" * _STEP_LOG_TRAIL_BLANK_LINES, end="", flush=True)
 
-            # Rolling history for LLM context
+            # Track preemptions in this step for cooldown
+            for a in parsed_actions:
+                if a.action_type == "PREEMPT":
+                    preempt_history[a.job_id] = step
+
+            # Rolling history — include dropped-action feedback so LLM can self-correct
+            dropped_note = (
+                f" | DROPPED (invalid): {', '.join(dropped)}" if dropped else ""
+            )
             history.append(
                 f"Step {step}: {action_str} → reward {reward:+.2f} | "
                 f"h{obs.current_hour:.0f}/{obs.total_hours:.0f} | "
-                f"{obs.last_action_result or 'ok'}"
+                f"{obs.last_action_result or 'ok'}{dropped_note}"
             )
 
             if done:
@@ -889,40 +1033,55 @@ async def main() -> None:
     Total expected runtime: < 15 minutes on a 2-vCPU / 8 GB machine
     (24 + 36 + 42 = 102 LLM calls × ~5 s each ≈ 8.5 minutes + env overhead).
     """
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
-    # If IMAGE_NAME looks like a URL, connect directly; otherwise use Docker
-    if IMAGE_NAME and IMAGE_NAME.startswith("http"):
-        env = GpuSchedulerEnv(base_url=IMAGE_NAME)
-    else:
-        env = await GpuSchedulerEnv.from_docker_image(IMAGE_NAME)
+    log_path = _setup_inference_log_file()
+    if log_path is not None:
+        print(f"[LOG] Full run output also written to: {log_path}", flush=True)
 
     try:
-        results: Dict[str, bool] = {}
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-        for task_name, max_steps, threshold in TASKS:
-            passed = await run_task(
-                client=client,
-                env=env,
-                task_name=task_name,
-                max_steps=max_steps,
-                success_threshold=threshold,
-            )
-            results[task_name] = passed
-            # Blank line between task blocks for readability
-            print("", flush=True)
+        # If IMAGE_NAME looks like a URL, connect directly; otherwise use Docker
+        if IMAGE_NAME and IMAGE_NAME.startswith("http"):
+            env = GpuSchedulerEnv(base_url=IMAGE_NAME)
+        else:
+            env = await GpuSchedulerEnv.from_docker_image(IMAGE_NAME)
 
-        # Final summary (informational — not part of the mandatory format)
-        all_passed = all(results.values())
-        summary    = " | ".join(f"{t}={'PASS' if v else 'FAIL'}" for t, v in results.items())
-        print(f"[SUMMARY] {summary} | all_passed={str(all_passed).lower()}", flush=True)
-
-    finally:
-        # Always clean up the Docker container, even on exception
         try:
-            await env.close()
-        except Exception as e:
-            print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True)
+            results: Dict[str, bool] = {}
+
+            for task_name, max_steps, threshold in TASKS:
+                passed = await run_task(
+                    client=client,
+                    env=env,
+                    task_name=task_name,
+                    max_steps=max_steps,
+                    success_threshold=threshold,
+                )
+                results[task_name] = passed
+                # Blank line between task blocks for readability
+                print("", flush=True)
+
+            # Final summary (informational — not part of the mandatory format)
+            all_passed = all(results.values())
+            summary = " | ".join(
+                f"{t}={'PASS' if v else 'FAIL'}" for t, v in results.items()
+            )
+            print(
+                f"[SUMMARY] {summary} | all_passed={str(all_passed).lower()}",
+                flush=True,
+            )
+
+        finally:
+            # Always clean up the Docker container, even on exception
+            try:
+                await env.close()
+            except Exception as e:
+                print(
+                    f"[DEBUG] env.close() error (container cleanup): {e}",
+                    flush=True,
+                )
+    finally:
+        _teardown_inference_log_file()
 
 
 if __name__ == "__main__":
