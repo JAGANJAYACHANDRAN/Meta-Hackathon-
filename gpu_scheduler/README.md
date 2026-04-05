@@ -43,14 +43,30 @@ Each node exposes a **memory contention** metric. When GPU utilisation exceeds 7
 | Action | Parameters | Description |
 |---|---|---|
 | `SCHEDULE` | `job_id`, `node_id` | Place a queued job on a node (0–7). Jobs needing >8 GPUs auto-span multiple fully-free nodes. |
-| `PREEMPT` | `job_id` | Evict a running job. Costs 10× remaining compute value + 1h checkpoint rollback. |
+| `PREEMPT` | `job_id` | Evict a running job. Costs 2× wasted checkpoint work + up to 2h progress rollback. P0 jobs cannot be preempted. |
 | `WAIT` | — | Advance the simulation clock without scheduling. |
+| `BATCH` | `sub_actions[]` | Execute multiple SCHEDULE/PREEMPT actions **atomically within one timestep**. The clock advances only once after all sub-actions complete. |
 
+### Single actions
 ```json
 { "action_type": "SCHEDULE", "job_id": "job_042", "node_id": 3 }
 { "action_type": "PREEMPT",  "job_id": "job_017" }
 { "action_type": "WAIT" }
 ```
+
+### Batch action (atomic)
+```json
+{
+  "action_type": "BATCH",
+  "sub_actions": [
+    { "action_type": "PREEMPT",  "job_id": "job_003" },
+    { "action_type": "PREEMPT",  "job_id": "job_008" },
+    { "action_type": "SCHEDULE", "job_id": "job_020", "node_id": 0 }
+  ]
+}
+```
+
+All sub-actions in a BATCH execute at the same simulated timestamp. This enables coordinated strategies like preempting multiple low-priority jobs and immediately scheduling a high-priority gang job — with no idle GPU penalties between sub-actions.
 
 ---
 
@@ -75,16 +91,18 @@ Each node exposes a **memory contention** metric. When GPU utilisation exceeds 7
 Reward is continuous — computed every step, not only at episode end.
 
 ```
-Reward_t = R_progress + R_cost − (R_preemption + R_sla + R_queue)
+Reward_t = R_progress − (R_idle + R_preemption + R_sla + R_queue)
 ```
 
 | Component | Type | Formula |
 |---|---|---|
-| **Progress** | Positive | `Σ (Δprogress_j × priority_weight_j)` per running job |
-| **Idle cost** | Negative | `idle_gpus × hours × hourly_rate × 0.3` |
-| **Preemption burn** | Negative | `gpu_count × remaining_hours × hourly_rate × 10` |
-| **SLA violation** | Negative | `gpu_count × duration × hourly_rate × 5` (one-time on breach) |
-| **Queue delay** | Negative | Small per-hour penalty for P0/P1 jobs waiting in queue |
+| **Progress** | Positive | `Σ (Δprogress_j × priority_weight_j)` per running job. Weights: P0=2×, P1=1.5×, P2=1×, P3=0.5× |
+| **Idle cost** | Negative | `idle_gpus × hours × hourly_rate × rate`. Rate = 0.2 when queue has work, 0.05 when empty |
+| **Preemption burn** | Negative | `gpu_count × min(elapsed_hours, 2.0) × hourly_rate × 2.0`. Capped at 2h checkpoint interval |
+| **SLA violation** | Negative | Initial: `gpu_count × duration × hourly_rate × 3.0` (one-time). Continuing: `gpu_count × hours × hourly_rate × 0.5` per step |
+| **Queue delay** | Negative | `gpu_count × hours × factor × hourly_rate × 0.1`. Factor: P0=2.0, P1=1.0, P2/P3=0 |
+
+For BATCH actions, all sub-action rewards (e.g. preemption burns) are summed, then one time-step reward is computed. Since all sub-actions execute atomically, freed GPUs are immediately available for scheduling within the same step — no intermediate idle penalties.
 
 ---
 
@@ -106,13 +124,15 @@ One week of mixed load. At **hour 72**, a **32-GPU P0 gang job** arrives with a 
 
 ## Real-World Tensions
 
-**Preemption burn** — stopping a job wastes all compute since the last checkpoint. The penalty is 10× remaining runtime cost.
+**Preemption burn** — stopping a job wastes compute since the last checkpoint (up to 2h). The penalty is 2× the wasted work's dollar cost.
 
-**Memory contention** — colocating too many jobs on one node degrades all of them. Spread load even when packing looks locally optimal.
+**Memory contention** — colocating too many jobs on one node degrades all of them (quadratic: `1 - 0.4 × contention²`). Spread load even when packing looks locally optimal.
 
-**Gang scheduling** — the 32-GPU P0 job needs 4 *fully* free nodes. Cannot scatter across partially-occupied nodes. Requires look-ahead planning across dozens of steps.
+**Gang scheduling** — the 32-GPU P0 job needs 4 *fully* free nodes. Cannot scatter across partially-occupied nodes. Use BATCH to preempt multiple jobs and schedule the gang job atomically in one step.
 
-**Checkpoint loss** — preempted jobs lose up to 1 hour of progress on rollback.
+**Checkpoint loss** — preempted jobs lose up to 2 hours of progress on rollback.
+
+**Atomic batching** — BATCH actions let the agent preempt + schedule in one timestep with zero idle-GPU waste between actions. Critical for the P0 emergency scenario where multiple nodes must be freed simultaneously.
 
 ---
 
@@ -165,7 +185,8 @@ The baseline `inference.py` runs an LLM agent against all three tasks sequential
 **Expected stdout:**
 ```
 [START] task=smooth_sailing env=gpu_scheduler model=Qwen/Qwen2.5-72B-Instruct
-[STEP] step=1 action=SCHEDULE job_003 0 reward=0.12 done=false error=null
+[STEP] step=1 action=BATCH[SCHEDULE job_003 0, SCHEDULE job_004 2] reward=0.12 done=false error=null
+[STEP] step=2 action=SCHEDULE job_005 1 reward=0.18 done=false error=null
 ...
 [END] success=true steps=24 score=0.621 rewards=0.12,0.18,...
 
@@ -174,9 +195,12 @@ The baseline `inference.py` runs an LLM agent against all three tasks sequential
 [END] success=true steps=36 score=0.487 rewards=...
 
 [START] task=p0_emergency env=gpu_scheduler model=Qwen/Qwen2.5-72B-Instruct
+[STEP] step=18 action=BATCH[PREEMPT job_003, PREEMPT job_008, SCHEDULE job_020 0] reward=-1.24 done=false error=null
 ...
 [END] success=false steps=42 score=0.284 rewards=...
 ```
+
+The LLM agent outputs multiple actions per turn using a structured `REASON + ACTIONS` format. Multiple SCHEDULE/PREEMPT actions are wrapped into a single BATCH and executed atomically (one clock tick). Single actions are sent directly without the BATCH wrapper.
 
 ---
 
