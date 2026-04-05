@@ -364,15 +364,11 @@ class GpuSchedulerEnvironment(Environment):
         Execute one agent decision and advance the simulation clock.
 
         Step sequence:
-            1. Apply the agent's action (SCHEDULE / PREEMPT / WAIT)
-               Returns an immediate reward delta for the action itself.
-            2. Advance the simulation clock by hours_per_step:
-               - Update progress for all running jobs (with contention degradation)
-               - Finalise completed jobs and check their SLA status
-               - Penalise any jobs that have blown past their deadline
-               - Release newly-arrived jobs into the visible queue
-               - Apply queue-delay penalty for P0/P1 jobs waiting too long
-               - Deduct idle-GPU opportunity cost
+            1. Apply the agent's action(s):
+               - Single action: SCHEDULE / PREEMPT / WAIT
+               - BATCH: apply all sub-actions atomically (no clock advance between them)
+               Returns an immediate reward delta for the action(s).
+            2. Advance the simulation clock by hours_per_step (once, even for BATCH)
             3. Sum action reward + time reward; accumulate into episode total
             4. Check terminal conditions (clock expired or all work done)
             5. Return the new observation (grader score embedded in metadata if done)
@@ -385,8 +381,11 @@ class GpuSchedulerEnvironment(Environment):
         """
         self._state.step_count += 1
 
-        # 1. Instant reward/penalty from the action itself
-        reward_action = self._apply_action(action)
+        # 1. Instant reward/penalty from the action(s)
+        if action.action_type == ActionType.BATCH:
+            reward_action = self._apply_batch(action)
+        else:
+            reward_action = self._apply_action(action)
 
         # 2. Time-driven reward: progress, costs, SLA violations, queue delay
         reward_time = self._advance_time(self._hours_per_step)
@@ -444,6 +443,47 @@ class GpuSchedulerEnvironment(Environment):
             f"UNKNOWN action type '{action.action_type}' — treated as WAIT."
         )
         return 0.0
+
+    def _apply_batch(self, action: GpuSchedulerAction) -> float:
+        """
+        Execute multiple sub-actions atomically within a single timestep.
+
+        Iterates through action.sub_actions, dispatching each SCHEDULE or
+        PREEMPT to the existing handlers. Accumulates rewards and builds a
+        combined result string. The clock does NOT advance between sub-actions.
+
+        If a sub-action fails (invalid job/node), it is skipped but the
+        remaining sub-actions still execute.
+
+        Args:
+            action: A BATCH-type action containing sub_actions list.
+
+        Returns:
+            Combined reward from all sub-actions.
+        """
+        if not action.sub_actions:
+            self._last_action_result = "BATCH: empty sub_actions list — treated as WAIT."
+            return 0.0
+
+        total_reward = 0.0
+        results: List[str] = []
+
+        for i, sub in enumerate(action.sub_actions):
+            sub_type = sub.action_type.upper()
+            if sub_type == "SCHEDULE":
+                reward = self._do_schedule(sub.job_id, sub.node_id)
+            elif sub_type == "PREEMPT":
+                reward = self._do_preempt(sub.job_id)
+            else:
+                self._last_action_result = f"BATCH sub-action {i}: unknown type '{sub_type}', skipped."
+                results.append(self._last_action_result)
+                continue
+
+            total_reward += reward
+            results.append(self._last_action_result)
+
+        self._last_action_result = " | ".join(results)
+        return total_reward
 
     def _get_free_gpus(self, node_id: int) -> int:
         """

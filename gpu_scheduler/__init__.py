@@ -27,6 +27,7 @@ from .models import (
     JobInfo,
     NodeInfo,
     ActionType,
+    SubAction,
 )
 
 __all__ = [
@@ -36,4 +37,5 @@ __all__ = [
     "JobInfo",
     "NodeInfo",
     "ActionType",
+    "SubAction",
 ]

@@ -34,27 +34,52 @@ from pydantic import BaseModel, Field
 
 class ActionType(str, Enum):
     """
-    The three discrete operations an agent can perform each step.
+    The discrete operations an agent can perform each step.
 
     SCHEDULE — place a queued job onto a specific node.
     PREEMPT  — immediately evict a running job back to the queue.
                Triggers a large penalty (preemption burn).
     WAIT     — advance the simulation clock one step without scheduling.
                Useful when the cluster is full or a better slot is coming.
+    BATCH    — execute multiple SCHEDULE/PREEMPT actions atomically within
+               one timestep, then advance the clock once.
     """
     SCHEDULE = "SCHEDULE"
     PREEMPT  = "PREEMPT"
     WAIT     = "WAIT"
+    BATCH    = "BATCH"
+
+
+class SubAction(BaseModel):
+    """A single action within a BATCH — either SCHEDULE or PREEMPT."""
+    action_type: str = Field(
+        ...,
+        description="SCHEDULE or PREEMPT",
+    )
+    job_id: str = Field(
+        ...,
+        description="ID of the job to schedule or preempt.",
+    )
+    node_id: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=7,
+        description="Target node index (0–7). Required for SCHEDULE.",
+    )
 
 
 class GpuSchedulerAction(Action):
     """
     Action submitted by the agent at each decision step.
 
-    Fields are optional depending on action_type:
+    For single actions:
         SCHEDULE → requires job_id + node_id
         PREEMPT  → requires job_id only
         WAIT     → no additional fields needed
+
+    For batch actions:
+        BATCH → requires sub_actions list. All sub-actions execute
+                atomically within one timestep (clock advances once).
 
     The environment server validates combinations and returns an error in
     the observation's `last_action_result` field if invalid.
@@ -62,7 +87,7 @@ class GpuSchedulerAction(Action):
 
     action_type: ActionType = Field(
         ...,
-        description="Which operation to perform: SCHEDULE, PREEMPT, or WAIT",
+        description="Which operation to perform: SCHEDULE, PREEMPT, WAIT, or BATCH",
     )
     job_id: Optional[str] = Field(
         default=None,
@@ -73,6 +98,10 @@ class GpuSchedulerAction(Action):
         ge=0,
         le=7,
         description="Target node index (0–7) for SCHEDULE actions.",
+    )
+    sub_actions: List["SubAction"] = Field(
+        default_factory=list,
+        description="List of sub-actions for BATCH action_type. Executed atomically.",
     )
 
 

@@ -74,6 +74,17 @@ class GpuSchedulerEnv(
         if action.node_id is not None:
             payload["node_id"] = action.node_id
 
+        # Serialize sub_actions for BATCH type
+        if action.sub_actions:
+            payload["sub_actions"] = [
+                {
+                    "action_type": sa.action_type,
+                    "job_id": sa.job_id,
+                    **({"node_id": sa.node_id} if sa.node_id is not None else {}),
+                }
+                for sa in action.sub_actions
+            ]
+
         return payload
 
     def _parse_result(self, payload: Dict) -> StepResult[GpuSchedulerObservation]:
