@@ -117,10 +117,12 @@ SYSTEM_PROMPT = textwrap.dedent("""
                                     The node must have enough free GPUs.
                                     Jobs needing >8 GPUs span multiple nodes
                                     (e.g. 32-GPU job → any 4 nodes with ≥8 free GPUs each).
-      PREEMPT <job_id>              Evict a running job. Penalty = 2× wasted work since last checkpoint.
-                                    Viable when freeing space for higher-priority jobs.
-      WAIT                          Advance the clock. Use when cluster is full, queue is empty,
-                                    or you are clearing space for a large incoming job.
+      PREEMPT <job_id>              Evict a running job. Burn scales with wasted checkpoint hours,
+                                    job progress sunk so far, and priority (preempting P1 hurts more than P3).
+                                    P0 jobs cannot be preempted.
+      WAIT                          Advance the clock ONLY when the schedulable queue is empty, the cluster
+                                    cannot place any queued job, or you need time for running jobs to finish
+                                    to free nodes for a large gang job.
 
     CRITICAL RULES
     ---------------
@@ -131,24 +133,34 @@ SYSTEM_PROMPT = textwrap.dedent("""
     • Do NOT re-schedule a job that is already running (listed under RUNNING JOBS).
     • Pick a node_id (0–7) that has enough free GPUs for the job.
 
-    REWARD SIGNALS
-    ---------------
-    + Progress reward:  proportional to job completion per step (weighted by priority)
-    − Idle GPU cost:    penalty for unused GPUs (higher when schedulable work is waiting)
-    − Preemption burn:  2× (gpu_count × wasted_checkpoint_hours × hourly_rate)
-    − SLA violation:    initial penalty when deadline is missed, plus continuing penalty while overdue
-    − Queue delay:      small penalty per hour P0/P1 jobs wait in queue
+    REWARD SIGNALS (dense, every step; align actions with these)
+    -----------------------------------------------------------
+    + Progress reward:     Each step adds (Δt / job duration) × priority weight × contention factor.
+                           Keeping jobs running earns immediate credit; contention slows effective rate.
+    − Idle GPU “rent”:     Unused GPUs are taxed hourly. Rate is LOW when the queue is empty, HIGHER
+                           when jobs are waiting, SEVERE when the backlog is large; it DOUBLES if any P0/P1
+                           is still in the queue. Idle capacity + backlog is one of the worst outcomes.
+    − SLA lateness:        After a small grace past deadline, penalty grows like (hours late)² × GPU count
+                           (capped per step so signals stay stable).
+    − Fragmentation tax:   Partially filled nodes that block common shapes (e.g. a full 8-GPU placement)
+                           incur a small ongoing penalty—prefer cleaner packing when you have a choice.
+    − Preemption burn:    Scales with wasted checkpoint hours, progress already made, and job priority.
+    − Queue delay:         Extra nudge while P0/P1 sit in the queue; long waits add starvation pressure.
 
     STRATEGY TIPS
     --------------
-    • Schedule ALL queued jobs as fast as possible — idle GPUs cost more when work is waiting
-    • Prefer nodes with MORE free GPUs to reduce contention (degrades progress quadratically)
-    • For multi-node jobs (>8 GPUs): pick nodes with 8 free GPUs each
-    • Watch deadline_hour — if a job's deadline is close, prioritise it
-    • Check UPCOMING ARRIVALS to plan for large incoming jobs
-    • If a large P0 job is arriving soon, consider freeing nodes in advance
-    • Preemption is viable for low-priority jobs when needed to make room
-    • WAIT only when the queue is empty or cluster is truly full
+    • If SCHEDULABLE JOBS is non-empty and some node has enough free GPUs for a job, SCHEDULE now—do
+      not WAIT. Waiting burns idle-GPU rent while the queue is non-empty.
+    • Prefer nodes with MORE free GPUs when placing a job to limit memory contention on that node.
+    • For multi-node jobs (>8 GPUs): the environment needs that many fully free nodes; pick an anchor
+      node_id that is fully free or let the env pick from fully free nodes.
+    • Watch deadline_hour and prioritise jobs closest to missing SLA.
+    • Use UPCOMING ARRIVALS to reserve capacity for a large gang job (e.g. 32-GPU P0); only then WAIT
+      strategically for running jobs to finish or use PREEMPT on lower priority.
+    • Preemption is for freeing space for higher-priority or gang jobs—not as a substitute for scheduling
+      when nodes are idle.
+    • WAIT only when the schedulable queue is empty, the cluster truly cannot place any queued job,
+      or you are deliberately clearing nodes for an imminent large job.
 
     OUTPUT FORMAT
     --------------
