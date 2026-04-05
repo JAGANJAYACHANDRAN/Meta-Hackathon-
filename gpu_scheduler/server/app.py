@@ -38,7 +38,7 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import GpuSchedulerAction, GpuSchedulerObservation
     from .gpu_scheduler_environment import GpuSchedulerEnvironment
-except ModuleNotFoundError:
+except (ImportError, ModuleNotFoundError):
     from models import GpuSchedulerAction, GpuSchedulerObservation
     from server.gpu_scheduler_environment import GpuSchedulerEnvironment
 
