@@ -97,9 +97,9 @@ tasks:
   - name: smooth_sailing
     difficulty: easy
     description: >
-      A calm 24-hour window with low-demand P2/P3 jobs and no deadlines.
+      A calm 24-hour window with moderate-demand P1–P3 jobs, some with deadlines.
       The agent must keep GPUs occupied by efficiently scheduling from the queue.
-      Grader score: 60% job completion rate + 40% GPU utilisation.
+      Grader score: 80% job completion rate + 20% GPU utilisation.
     episode_length: 24        # simulated hours
     agent_steps: 24           # 1 h/step
     success_threshold: 0.40

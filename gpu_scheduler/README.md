@@ -88,19 +88,22 @@ All sub-actions in a BATCH execute at the same simulated timestamp. This enables
 
 ## Reward Function
 
-Reward is continuous — computed every step, not only at episode end.
+Reward is continuous and bounded to **[0.0, 1.0]** — computed every step, not only at episode end.
+
+A reward of **0.5 is neutral** (no progress, no penalty). Values above 0.5 indicate net-positive scheduling; below 0.5 indicates waste or violations.
 
 ```
-Reward_t = R_progress − (R_idle + R_preemption + R_sla + R_queue)
+raw = R_progress − (R_idle + R_preemption + R_sla + R_queue)
+Reward_t = clamp(0.5 + raw, 0.0, 1.0)
 ```
 
 | Component | Type | Formula |
 |---|---|---|
-| **Progress** | Positive | `Σ (Δprogress_j × priority_weight_j)` per running job. Weights: P0=2×, P1=1.5×, P2=1×, P3=0.5× |
-| **Idle cost** | Negative | `idle_gpus × hours × hourly_rate × rate`. Rate = 0.2 when queue has work, 0.05 when empty |
-| **Preemption burn** | Negative | `gpu_count × min(elapsed_hours, 2.0) × hourly_rate × 2.0`. Capped at 2h checkpoint interval |
-| **SLA violation** | Negative | Initial: `gpu_count × duration × hourly_rate × 3.0` (one-time). Continuing: `gpu_count × hours × hourly_rate × 0.5` per step |
-| **Queue delay** | Negative | `gpu_count × hours × factor × hourly_rate × 0.1`. Factor: P0=2.0, P1=1.0, P2/P3=0 |
+| **Progress** | Positive | `Σ (Δprogress_j × priority_weight_j)` per running job. Weights: P0=0.5×, P1=0.4×, P2=0.25×, P3=0.1× |
+| **Idle cost** | Negative | `idle_gpus × hours × hourly_rate × rate`. Rate = 0.08 when queue has work, 0.02 when empty |
+| **Preemption burn** | Negative | `gpu_count × min(elapsed_hours, 2.0) × hourly_rate × 0.3`. Capped at 2h checkpoint interval |
+| **SLA violation** | Negative | Initial: `gpu_count × duration × hourly_rate × 0.15` (one-time). Continuing: `gpu_count × hours × hourly_rate × 0.05` per step |
+| **Queue delay** | Negative | `gpu_count × hours × factor × hourly_rate × 0.03`. Factor: P0=0.5, P1=0.25, P2/P3=0 |
 
 For BATCH actions, all sub-action rewards (e.g. preemption burns) are summed, then one time-step reward is computed. Since all sub-actions execute atomically, freed GPUs are immediately available for scheduling within the same step — no intermediate idle penalties.
 
@@ -109,8 +112,8 @@ For BATCH actions, all sub-action rewards (e.g. preemption burns) are summed, th
 ## Tasks
 
 ### Easy — `smooth_sailing` (24h, 24 steps at 1h/step)
-Low-demand window with 12 small P2/P3 jobs, no deadlines. Keep GPUs occupied.
-**Grader:** `0.6 × completion_rate + 0.4 × gpu_utilisation`
+Moderate-demand window with ~24 P1–P3 jobs, some with deadlines. Keep GPUs occupied.
+**Grader:** `0.8 × completion_rate + 0.2 × gpu_utilisation`
 
 ### Medium — `deadline_crunch` (72h, 36 steps at 2h/step)
 ~28 mixed P1/P2 jobs, 75% with tight SLA deadlines. Prioritise time-sensitive work.
@@ -124,7 +127,7 @@ One week of mixed load. At **hour 72**, a **32-GPU P0 gang job** arrives with a 
 
 ## Real-World Tensions
 
-**Preemption burn** — stopping a job wastes compute since the last checkpoint (up to 2h). The penalty is 2× the wasted work's dollar cost.
+**Preemption burn** — stopping a job wastes compute since the last checkpoint (up to 2h). The penalty is scaled to pull the step reward toward 0.
 
 **Memory contention** — colocating too many jobs on one node degrades all of them (quadratic: `1 - 0.4 × contention²`). Spread load even when packing looks locally optimal.
 

@@ -216,7 +216,7 @@ SYSTEM_PROMPT = textwrap.dedent("""
        b. No other way to free GPUs (no jobs finishing soon)
        c. The preempted job is low-priority (P3 first, then P2)
        NEVER preempt to "reshuffle" or "optimize". NEVER preempt a job you
-       just scheduled. Each preemption burns 2× the wasted work as penalty.
+       just scheduled. Each preemption carries a large burn penalty.
     9. NEVER preempt and reschedule the same jobs back and forth. This creates
        a loop that destroys your score. If you preempted a job, let it run
        after rescheduling — do NOT preempt it again.
@@ -244,13 +244,14 @@ SYSTEM_PROMPT = textwrap.dedent("""
     - Plan subsequent actions accounting for these changes
     - WAIT should be the ONLY action if nothing else is needed (ends the turn)
 
-    REWARD SIGNALS
-    ---------------
-    + Progress: proportional to job completion per step (P0=2x, P1=1.5x, P2=1x, P3=0.5x)
+    REWARD SIGNALS (bounded 0.0–1.0, where 0.5 = neutral)
+    ----------------------------------------------------
+    + Progress: proportional to job completion per step (P0=0.5x, P1=0.4x, P2=0.25x, P3=0.1x)
     - Idle GPU cost: penalty for unused GPUs (higher when schedulable work is waiting)
-    - Preemption burn: 2x (gpu_count x wasted_hours x hourly_rate)
-    - SLA violation: large initial penalty + continuing penalty while overdue
+    - Preemption burn: gpu_count × wasted_hours × rate × 0.3
+    - SLA violation: initial penalty + continuing penalty while overdue
     - Queue delay: penalty per hour P0/P1 jobs wait in queue
+    Reward > 0.5 = good step, < 0.5 = net-negative step
 
     RESPONSE FORMAT (STRICT)
     -------------------------

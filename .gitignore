@@ -14,3 +14,6 @@ venv/
 
 # OS/editor noise
 .DS_Store
+
+# Inference run logs (see INFERENCE_LOG_FILE in gpu_scheduler/inference.py)
+gpu_scheduler/logs/

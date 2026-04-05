@@ -66,14 +66,18 @@ REWARD_SCALE = 1.0 / HOURLY_RATE_CLUSTER
 # Simulation tuning knobs
 # ---------------------------------------------------------------------------
 CONTENTION_DEGRADATION      = 0.4   # smooth quadratic: rate = 1 - 0.4 × contention²
-PREEMPTION_BURN_MULTIPLIER  = 2.0   # preemption costs 2× the wasted checkpoint work
+PREEMPTION_BURN_MULTIPLIER  = 0.3   # preemption penalty (scaled for [0,1] reward range)
 PREEMPTION_CHECKPOINT_HOURS = 2.0   # assumed checkpoint interval in hours
 
-# P0 progress contributes 2× more reward than P3 (encourages prioritising critical work)
-PRIORITY_WEIGHTS: Dict[int, float] = {0: 2.0, 1: 1.5, 2: 1.0, 3: 0.5}
+# Progress weights — scaled so total per-step progress stays in ~[0, 0.3]
+PRIORITY_WEIGHTS: Dict[int, float] = {0: 0.50, 1: 0.40, 2: 0.25, 3: 0.10}
 
 # Queue delay penalty only fires for high-priority jobs sitting idle in queue
-PRIORITY_QUEUE_FACTORS: Dict[int, float] = {0: 2.0, 1: 1.0, 2: 0.0, 3: 0.0}
+PRIORITY_QUEUE_FACTORS: Dict[int, float] = {0: 0.50, 1: 0.25, 2: 0.0, 3: 0.0}
+
+# Reward is centred at 0.5 (neutral), then clamped to [0.0, 1.0].
+# >0.5 = net-positive step, <0.5 = net-negative step.
+REWARD_NEUTRAL = 0.5
 
 # ---------------------------------------------------------------------------
 # Task configuration table
@@ -285,7 +289,7 @@ class GpuSchedulerEnvironment(Environment):
         self._p0_job_completed:         bool  = False
         self._cumulative_gpu_hrs_used:  float = 0.0
         self._cumulative_gpu_hrs_avail: float = 0.0
-        self._compute_burn_usd:         float = 0.0
+        self._cluster_cost_usd:         float = 0.0
         self._cumulative_reward:        float = 0.0
         self._sla_penalized_jobs:       set   = set()
 
@@ -347,7 +351,7 @@ class GpuSchedulerEnvironment(Environment):
         self._p0_job_completed         = False
         self._cumulative_gpu_hrs_used  = 0.0
         self._cumulative_gpu_hrs_avail = 0.0
-        self._compute_burn_usd         = 0.0
+        self._cluster_cost_usd         = 0.0
         self._cumulative_reward        = 0.0
 
         # Fixed seed → identical job schedule every run → reproducible grader scores
@@ -369,7 +373,8 @@ class GpuSchedulerEnvironment(Environment):
                - BATCH: apply all sub-actions atomically (no clock advance between them)
                Returns an immediate reward delta for the action(s).
             2. Advance the simulation clock by hours_per_step (once, even for BATCH)
-            3. Sum action reward + time reward; accumulate into episode total
+            3. Sum action reward + time reward; normalise to [0.0, 1.0]
+               (0.5 = neutral, >0.5 = good, <0.5 = bad); accumulate
             4. Check terminal conditions (clock expired or all work done)
             5. Return the new observation (grader score embedded in metadata if done)
 
@@ -377,7 +382,7 @@ class GpuSchedulerEnvironment(Environment):
             action: Typed GpuSchedulerAction from the agent.
 
         Returns:
-            GpuSchedulerObservation with updated cluster state, step reward, done flag.
+            GpuSchedulerObservation with step reward in [0.0, 1.0], done flag.
         """
         self._state.step_count += 1
 
@@ -390,7 +395,9 @@ class GpuSchedulerEnvironment(Environment):
         # 2. Time-driven reward: progress, costs, SLA violations, queue delay
         reward_time = self._advance_time(self._hours_per_step)
 
-        total_reward = reward_action + reward_time
+        raw_reward = reward_action + reward_time
+        # Normalise to [0.0, 1.0]: 0.5 = neutral, >0.5 = good, <0.5 = bad
+        total_reward = max(0.0, min(1.0, REWARD_NEUTRAL + raw_reward))
         self._cumulative_reward += total_reward
 
         # 3. Termination check
@@ -667,7 +674,9 @@ class GpuSchedulerEnvironment(Environment):
         job.assigned_nodes = []
         self._queue.insert(0, job)
         del self._active_jobs[job_id]
-        self._preempted_jobs.append(job)
+        # Track unique preemption events (avoid over-counting repeated preemptions)
+        if not any(j.job_id == job_id for j in self._preempted_jobs):
+            self._preempted_jobs.append(job)
 
         self._last_action_result = (
             f"PREEMPTED '{job_id}' [{job.priority_label}] — "
@@ -766,14 +775,14 @@ class GpuSchedulerEnvironment(Environment):
                         job.gpu_count
                         * job.duration_hours
                         * HOURLY_RATE_PER_GPU
-                        * 3.0
+                        * 0.15           # was 3.0 — rescaled for [0,1] reward
                         * REWARD_SCALE
                     )
                     reward -= initial_penalty
                     self._sla_penalized_jobs.add(job.job_id)
                 continuing_penalty = (
                     job.gpu_count * hours * HOURLY_RATE_PER_GPU
-                    * 0.5 * REWARD_SCALE
+                    * 0.05 * REWARD_SCALE   # was 0.5 — rescaled for [0,1] reward
                 )
                 reward -= continuing_penalty
 
@@ -788,7 +797,7 @@ class GpuSchedulerEnvironment(Environment):
                 # Small per-step nudge to dispatch critical jobs promptly
                 reward -= (
                     job.gpu_count * hours * factor
-                    * HOURLY_RATE_PER_GPU * REWARD_SCALE * 0.1
+                    * HOURLY_RATE_PER_GPU * REWARD_SCALE * 0.03  # was 0.1
                 )
 
         # 6b. Idle-GPU opportunity cost: unused GPUs are wasted money -------------
@@ -798,11 +807,11 @@ class GpuSchedulerEnvironment(Environment):
         # Track cumulative utilisation for grader score computation
         self._cumulative_gpu_hrs_used  += active_gpus * hours
         self._cumulative_gpu_hrs_avail += TOTAL_GPUS  * hours
-        self._compute_burn_usd         += TOTAL_GPUS  * hours * HOURLY_RATE_PER_GPU
+        self._cluster_cost_usd         += TOTAL_GPUS  * hours * HOURLY_RATE_PER_GPU
 
         # Idle penalty: higher when schedulable work is waiting, low when queue is empty
         has_pending_work = len(self._queue) > 0
-        idle_rate = 0.2 if has_pending_work else 0.05
+        idle_rate = 0.08 if has_pending_work else 0.02   # was 0.2 / 0.05
         reward -= idle_gpus * hours * HOURLY_RATE_PER_GPU * REWARD_SCALE * idle_rate
 
         return reward
@@ -821,7 +830,9 @@ class GpuSchedulerEnvironment(Environment):
             from_hour: Inclusive start of the arrival window.
             to_hour:   Inclusive end of the arrival window.
         """
-        # Build the set of job IDs that have already entered any lifecycle stage
+        # Build the set of job IDs that have already entered any lifecycle stage.
+        # Note: preempted jobs also appear in _queue (re-inserted at front), so
+        # the _preempted_jobs check is redundant but kept for defensive clarity.
         already_seen: set = (
             {j.job_id for j in self._queue}
             | set(self._active_jobs.keys())
@@ -1034,7 +1045,7 @@ class GpuSchedulerEnvironment(Environment):
             upcoming_jobs       = upcoming,
             current_hour        = round(self._current_hour, 2),
             total_hours         = self._total_hours,
-            compute_burn_so_far = round(self._compute_burn_usd, 2),
+            compute_burn_so_far = round(self._cluster_cost_usd, 2),
             task_name           = self._task_name,
             last_action_result  = self._last_action_result,
             done                = done,
