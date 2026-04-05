@@ -230,15 +230,43 @@ SYSTEM_PROMPT = textwrap.dedent("""
 # that the LLM can reason over
 # ---------------------------------------------------------------------------
 
+def _fragmentation_hint(node) -> str:
+    """Human-readable fragmentation / packing hint (aligns with env fragmentation tax tiers)."""
+    free = node.free_gpus
+    tot = node.total_gpus
+    if free == 0 or free == tot:
+        return ""
+    fs = getattr(node, "fragmentation_score", 0.0) or 0.0
+    if fs > 0.001:
+        return f" ⚠ FRAGMENTED (score={fs:.2f}, {free} free — hard to place 8-GPU jobs)"
+    if free < 2:
+        return f" ⚠ FRAGMENTED ({free} free — cannot fit ≥2-GPU job)"
+    if free < 4:
+        return f" ⚠ FRAGMENTED ({free} free — cannot fit 4 or 8-GPU job)"
+    return f" ⚠ FRAGMENTED ({free} free — cannot fit full 8-GPU job on this node alone)"
+
+
+def _placement_summary(job: JobInfo) -> str:
+    """Describe required capacity and which nodes hold the job (running jobs only)."""
+    if not job.assigned_nodes:
+        return "—"
+    if len(job.assigned_nodes) == 1:
+        n = job.assigned_nodes[0]
+        return f"node {n} | {job.gpu_count} GPUs"
+    # Gang job: env uses full 8 GPUs per listed node
+    nn = len(job.assigned_nodes)
+    return f"nodes {job.assigned_nodes} | {job.gpu_count} GPUs total ({nn}×8 GPUs across nodes)"
+
+
 def format_observation(obs: GpuSchedulerObservation, step: int) -> str:
     """
     Render a GpuSchedulerObservation as a compact, human-readable block.
 
     Structured into four sections the LLM can scan quickly:
       1. Episode header (step, hour, burn)
-      2. Node table (GPUs used/free + contention bar)
-      3. Running jobs table
-      4. Queue table (with deadlines highlighted)
+      2. Cluster utilization snapshot
+      3. Node table (GPUs used/free, contention, jobs with per-job GPU counts)
+      4. Running & queue tables (capacity, assigned nodes where applicable)
 
     Args:
         obs:  The observation returned by env.step() or env.reset().
@@ -259,48 +287,75 @@ def format_observation(obs: GpuSchedulerObservation, step: int) -> str:
         "",
     ]
 
+    # --- Cluster utilization ---
+    total_cluster_gpus = sum(n.total_gpus for n in obs.nodes)
+    used_cluster_gpus = sum(n.used_gpus for n in obs.nodes)
+    pct = (100.0 * used_cluster_gpus / total_cluster_gpus) if total_cluster_gpus else 0.0
+    lines.append(
+        f"CLUSTER UTILIZATION: {used_cluster_gpus}/{total_cluster_gpus} GPUs in use "
+        f"({pct:.1f}%) | running: {len(obs.active_jobs)} jobs | queued: {len(obs.queue)} jobs"
+    )
+    lines.append("")
+
+    job_gpu_required: Dict[str, int] = {j.job_id: j.gpu_count for j in obs.active_jobs}
+
     # --- Node table ---
-    lines.append("NODES  (node_id | used/total GPUs | contention | running jobs)")
+    lines.append(
+        "NODES  (node_id | used/free/total | contention | jobs on node with GPU share)"
+    )
     for node in obs.nodes:
-        # Visual contention bar: ▓ per 10% contention, ░ for free headroom
-        filled  = int(node.memory_contention * 10)
-        bar     = "▓" * filled + "░" * (10 - filled)
-        # Flag nodes where quadratic contention degradation is significant (>15%)
-        warn    = " ⚠ HIGH CONTENTION" if node.memory_contention >= 0.6 else ""
-        jobs_str = ", ".join(node.running_jobs) if node.running_jobs else "idle"
+        filled = int(node.memory_contention * 10)
+        bar    = "▓" * filled + "░" * (10 - filled)
+        warn   = " ⚠ HIGH CONTENTION" if node.memory_contention >= 0.6 else ""
+        frag   = _fragmentation_hint(node)
+        if node.running_jobs:
+            parts: List[str] = []
+            for jid in node.running_jobs:
+                g = job_gpu_required.get(jid, 0)
+                parts.append(f"{jid}({g} GPUs)" if g else jid)
+            jobs_detail = ", ".join(parts)
+        else:
+            jobs_detail = "idle"
         lines.append(
-            f"  Node {node.node_id}: {node.used_gpus}/{node.total_gpus} GPUs"
-            f" | [{bar}] {node.memory_contention:.2f}{warn}"
-            f" | {jobs_str}"
+            f"  Node {node.node_id}: {node.used_gpus}/{node.free_gpus}/{node.total_gpus} used/free/total"
+            f" | [{bar}] {node.memory_contention:.2f}{warn}{frag}"
+            f" | {jobs_detail}"
         )
 
     # --- Running jobs table ---
-    lines += ["", "RUNNING JOBS  (job_id | priority | GPUs | progress | deadline)"]
+    lines += [
+        "",
+        "RUNNING JOBS  (job_id | priority | GPUs required | placement | progress | deadline)",
+    ]
     if obs.active_jobs:
         for job in obs.active_jobs:
-            dl   = f"deadline h{job.deadline_hour:.0f}" if job.deadline_hour else "no deadline"
-            # Highlight jobs in danger of missing their SLA
+            dl = f"deadline h{job.deadline_hour:.0f}" if job.deadline_hour else "no deadline"
             urgent = ""
-            if job.deadline_hour and (job.deadline_hour - obs.current_hour) < (job.duration_hours * (1 - job.progress)):
+            if job.deadline_hour and (job.deadline_hour - obs.current_hour) < (
+                job.duration_hours * (1 - job.progress)
+            ):
                 urgent = " ⚠ AT RISK"
+            place = _placement_summary(job)
             lines.append(
-                f"  {job.job_id:12s} [{job.priority_label}] | {job.gpu_count:2d} GPUs"
-                f" | {job.progress:5.1%} done | nodes={job.assigned_nodes}"
-                f" | {dl}{urgent}"
+                f"  {job.job_id:12s} [{job.priority_label}] | {job.gpu_count:2d} GPUs req. | {place}"
+                f" | {job.progress:5.1%} done | {dl}{urgent}"
             )
     else:
         lines.append("  (no jobs currently running)")
 
     # --- Queue table ---
-    lines += ["", "JOB QUEUE  (job_id | priority | GPUs needed | duration | queued_for | deadline)"]
+    lines += [
+        "",
+        "JOB QUEUE  (job_id | priority | GPUs required | assigned_nodes | duration | queued | deadline)",
+    ]
     if obs.queue:
         for job in obs.queue:
-            dl   = f"deadline h{job.deadline_hour:.0f}" if job.deadline_hour else "no deadline"
-            new_badge = " NEW (just landed)" if job.hours_in_queue < 0.1 else ""
+            dl = f"deadline h{job.deadline_hour:.0f}" if job.deadline_hour else "no deadline"
+            new_badge = " NEW" if job.hours_in_queue < 0.1 else ""
+            assigned = "— (queued; schedule to assign nodes)"
             lines.append(
-                f"  {job.job_id:12s} [{job.priority_label}] | {job.gpu_count:2d} GPUs needed{new_badge}"
-                f" | {job.duration_hours:.0f}h runtime"
-                f" | queued {job.hours_in_queue:.1f}h | {dl}"
+                f"  {job.job_id:12s} [{job.priority_label}] | {job.gpu_count:2d} GPUs req.{new_badge} | {assigned}"
+                f" | {job.duration_hours:.0f}h runtime | queued {job.hours_in_queue:.1f}h | {dl}"
             )
     else:
         lines.append("  (queue is empty)")
