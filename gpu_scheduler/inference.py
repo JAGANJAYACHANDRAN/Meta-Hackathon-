@@ -60,6 +60,7 @@ load_dotenv(_env_path)
 
 # Import typed client + models from the gpu_scheduler package
 from gpu_scheduler import (
+    ActionType,
     GpuSchedulerAction,
     GpuSchedulerEnv,
     GpuSchedulerObservation,
@@ -295,8 +296,9 @@ def format_observation(obs: GpuSchedulerObservation, step: int) -> str:
     if obs.queue:
         for job in obs.queue:
             dl   = f"deadline h{job.deadline_hour:.0f}" if job.deadline_hour else "no deadline"
+            new_badge = " NEW (just landed)" if job.hours_in_queue < 0.1 else ""
             lines.append(
-                f"  {job.job_id:12s} [{job.priority_label}] | {job.gpu_count:2d} GPUs"
+                f"  {job.job_id:12s} [{job.priority_label}] | {job.gpu_count:2d} GPUs needed{new_badge}"
                 f" | {job.duration_hours:.0f}h runtime"
                 f" | queued {job.hours_in_queue:.1f}h | {dl}"
             )
@@ -309,7 +311,7 @@ def format_observation(obs: GpuSchedulerObservation, step: int) -> str:
         for job in obs.upcoming_jobs:
             dl   = f"deadline h{job.deadline_hour:.0f}" if job.deadline_hour else "no deadline"
             lines.append(
-                f"  {job.job_id:12s} [{job.priority_label}] | {job.gpu_count:2d} GPUs"
+                f"  {job.job_id:12s} [{job.priority_label}] | {job.gpu_count:2d} GPUs needed"
                 f" | {job.duration_hours:.0f}h runtime"
                 f" | arrives h{job.arrival_hour:.0f} | {dl}"
             )
@@ -464,6 +466,15 @@ def validate_action(
             return fallback
 
     return action
+
+
+def _action_to_log_line(action: GpuSchedulerAction) -> str:
+    """Human-readable action actually sent to env.step() (after validation corrections)."""
+    if action.action_type == ActionType.SCHEDULE:
+        return f"SCHEDULE {action.job_id} {action.node_id}"
+    if action.action_type == ActionType.PREEMPT:
+        return f"PREEMPT {action.job_id}"
+    return "WAIT"
 
 
 def get_llm_action(
@@ -651,8 +662,11 @@ async def run_task(
 
             # --- Get action from LLM ---
             action, raw_response = get_llm_action(client, obs, step, history)
-            # Use only the first line as the logged action string
-            action_str = raw_response.split("\n")[0].strip()
+            # Log the action actually executed (validate_action may correct WAIT → SCHEDULE, etc.)
+            action_str = _action_to_log_line(action)
+            raw_first = raw_response.split("\n")[0].strip()
+            if raw_first and raw_first != action_str:
+                action_str = f"{action_str}  [llm_line1: {raw_first}]"
 
             # --- Execute action in the environment ---
             result = await env.step(action)
