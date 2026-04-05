@@ -155,6 +155,30 @@ class JobInfo(BaseModel):
         ge=0.0,
         description="Simulated hour at which this job arrived in the cluster queue.",
     )
+    progress_this_step: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Fraction of total job work completed in the last simulation step "
+            "(dense progress signal for RL)."
+        ),
+    )
+    effective_rate: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Effective progress rate multiplier this step (1.0 = nominal; "
+            "lower under memory contention)."
+        ),
+    )
+    hours_waiting: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Cumulative simulated hours this job has spent queued or running without "
+            "completion — used for starvation penalties and priority escalation."
+        ),
+    )
 
 
 class NodeInfo(BaseModel):
@@ -200,6 +224,23 @@ class NodeInfo(BaseModel):
     running_jobs: List[str] = Field(
         default_factory=list,
         description="job_ids of all jobs currently executing on this node.",
+    )
+    largest_contiguous_free: int = Field(
+        default=8,
+        ge=0,
+        le=8,
+        description=(
+            "Largest contiguous block of free GPUs on this node (here: same as free_gpus "
+            "because allocations pack from slot 0)."
+        ),
+    )
+    fragmentation_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Heuristic 0–1 style fragmentation pressure when the node is partially used "
+            "but cannot fit common job shapes (e.g. 8-GPU jobs)."
+        ),
     )
 
 

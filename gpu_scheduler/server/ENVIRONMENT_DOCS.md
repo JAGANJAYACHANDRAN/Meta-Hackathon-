@@ -93,7 +93,6 @@ Implements the OpenEnv `Environment` interface. Each WebSocket session gets its 
 | `_compute_burn_usd` | `float` | Cumulative cost in USD |
 | `_cumulative_reward` | `float` | Total reward across episode |
 | `_last_action_result` | `str` | Human-readable feedback shown to LLM |
-| `_sla_penalized_jobs` | `set` | Job IDs that have already received the initial SLA violation penalty |
 
 **Grader metrics:** `_total_jobs_spawned`, `_sla_jobs_total`, `_sla_jobs_met` (float — supports partial credit), `_p0_job_completed`, `_cumulative_gpu_hrs_used`, `_cumulative_gpu_hrs_avail`
 
@@ -110,7 +109,7 @@ Implements the OpenEnv `Environment` interface. Each WebSocket session gets its 
 
 **Flow:**
 1. Look up task in `TASK_CONFIGS`
-2. Wipe ALL episode state (nodes, jobs, metrics, `_sla_penalized_jobs`)
+2. Wipe ALL episode state (nodes, jobs, metrics)
 3. Create seeded RNG → call `_generate_job_schedule()`
 4. Call `_release_arriving_jobs(0.0, 0.0)` to put hour-0 jobs in queue
 5. Return initial observation via `_build_observation(reward=0.0, done=False)`
@@ -206,7 +205,8 @@ Always sets `_last_action_result` so the LLM sees feedback.
 - P0 jobs are **non-preemptible** (else `-0.5`)
 
 **Penalties applied:**
-1. **Preemption Burn:** `gpu_count × min(elapsed_hours, 2.0) × hourly_rate × 2.0 × REWARD_SCALE`
+1. **Preemption Burn (sunk-cost + priority aware):**
+   `gpu_count × min(elapsed_hours, 2.0) × hourly_rate × PREEMPTION_BURN_MULTIPLIER × (1 + progress × SUNK_COST_MULTIPLIER) × (1 + (2 − priority×0.5)) × REWARD_SCALE`
    Wasted work is capped at `PREEMPTION_CHECKPOINT_HOURS` (2h), modelling real checkpoint intervals.
 2. **Checkpoint Rollback:** Job loses up to 2 hours of progress (rolls back to last checkpoint).
 
@@ -224,16 +224,17 @@ Always sets `_last_action_result` so the LLM sees feedback.
 
 **Purpose:** Advance the simulation clock and process all side effects. This is where most of the reward signal comes from.
 
-**Executes 6 operations in strict order:**
+**Executes several operations in strict order:**
 
-#### 1. Update progress for all running jobs
+#### 1. Update progress for all running jobs (dense reward)
 - Compute contention on each job's nodes via `_average_contention()`
 - **Smooth quadratic degradation:** `progress_rate = 1.0 - 0.4 × contention²`
   - At contention 0.5 (4/8 GPUs): 10% slowdown
   - At contention 0.75 (6/8 GPUs): 22.5% slowdown
   - At contention 1.0 (8/8 GPUs): 40% slowdown
-- Progress delta: `(hours / duration_hours) × progress_rate`
-- **Reward += delta × PRIORITY_WEIGHTS[priority]** (P0 progress worth 2×)
+- Progress delta: `(hours / duration_hours) × progress_rate` → stored on `JobInfo.progress_this_step`; `effective_rate = progress_rate`
+- **Escalation:** after long `hours_waiting`, the effective priority index moves toward P0 (stronger progress reward weight).
+- **Reward += (hours/duration) × progress_rate × PRIORITY_WEIGHTS[effective_priority] × CONTENTION_REWARD_FACTOR**
 - Mark jobs that hit 100% as newly completed
 
 #### 2. Finalise completed jobs
@@ -249,28 +250,32 @@ Always sets `_last_action_result` so the LLM sees feedback.
 #### 3. Advance the clock
 - `_current_hour = min(old_hour + hours, _total_hours)`
 
-#### 4. SLA violations (graduated)
-- For every running/queued job past its deadline:
-  - **First violation:** initial penalty = `gpu_count × duration × hourly_rate × 3.0 × REWARD_SCALE`
-  - **Continuing penalty** (every step while overdue): `gpu_count × hours × hourly_rate × 0.5 × REWARD_SCALE`
-  - Job is tracked in `_sla_penalized_jobs` to prevent double-counting the initial penalty
+#### 4. SLA violations (quadratic lateness, capped per step)
+- For every running/queued job past its deadline (after a small grace `MIN_PENALTY_HOURS`):
+  - Let `late = min(current_hour − deadline − grace, SLA_LATE_CAP_HOURS)`
+  - **Penalty** ≈ `late² × gpu_count × hourly_rate × SLA_QUADRATIC_MULTIPLIER × REWARD_SCALE`, capped by `MAX_SLA_PENALTY` each step.
 
 #### 5. Release newly-arrived jobs
 - Calls `_release_arriving_jobs(old_hour, new_hour)`
 - Moves jobs from master schedule → visible queue
 
 #### 6a. Queue-delay penalty
-- For each queued job: `hours_in_queue += hours`
+- For each queued job: `hours_in_queue += hours`, `hours_waiting += hours`
+- For each active job: `hours_waiting += hours`
 - P0 jobs: penalty = `gpu_count × hours × 2.0 × hourly_rate × REWARD_SCALE × 0.1`
 - P1 jobs: penalty = `gpu_count × hours × 1.0 × hourly_rate × REWARD_SCALE × 0.1`
 - P2/P3: no queue penalty
+- **Starvation:** queued jobs with `hours_waiting > STARVATION_THRESHOLD_HOURS` pay an extra mild quadratic penalty (capped per step).
 
-#### 6b. Idle-GPU opportunity cost (demand-scaled)
+#### 6b. Idle-GPU opportunity cost (graduated rent)
 - `idle_gpus = 64 - active_gpus`
-- **When schedulable work is waiting** (queue non-empty): `idle_rate = 0.2`
-- **When no work is waiting** (queue empty): `idle_rate = 0.05`
+- **Idle rate** depends on queue length: empty queue → `IDLE_GPU_BASE_RATE`; short queue → `IDLE_GPU_QUEUE_RATE`; long queue (`> IDLE_BACKLOG_THRESHOLD`) → `IDLE_GPU_BACKLOG_RATE`.
+- If any P0/P1 job is queued, the idle rate is multiplied by `IDLE_PRIORITY_MULTIPLIER`.
 - **Penalty = idle_gpus × hours × hourly_rate × REWARD_SCALE × idle_rate**
 - Tracks `_cumulative_gpu_hrs_used` and `_cumulative_gpu_hrs_avail` for grader
+
+#### 6c. Fragmentation tax
+- Partially used nodes that cannot fit common GPU counts pay an hourly tax via `_calculate_fragmentation_penalty(hours)`.
 
 ---
 

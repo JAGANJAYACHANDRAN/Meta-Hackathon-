@@ -10,6 +10,12 @@ GPU Scheduler Environment — Core Simulation Engine
 Simulates an 8-node × 8-GPU cluster ($100,000/day) where an agent
 must schedule, preempt, and wait to minimise "compute burn".
 
+Reward refinements (dense signals):
+  • Each step accrues progress reward proportional to (Δt/Duration)×contention×priority.
+  • Idle GPUs pay queue-depth- and priority-aware "rent".
+  • SLA misses use capped quadratic lateness; queued starvation adds a mild quadratic nudge.
+  • Partial packing pays a fragmentation tax; preemption burn scales with progress sunk.
+
 Three tasks of escalating difficulty:
     EASY   — smooth_sailing:   24h,  moderate demand P1–P3 mix with some deadlines
     MEDIUM — deadline_crunch:  72h,  P1–P3 jobs with bursty arrivals and tight SLAs
@@ -74,6 +80,41 @@ PRIORITY_WEIGHTS: Dict[int, float] = {0: 2.0, 1: 1.5, 2: 1.0, 3: 0.5}
 
 # Queue delay penalty only fires for high-priority jobs sitting idle in queue
 PRIORITY_QUEUE_FACTORS: Dict[int, float] = {0: 2.0, 1: 1.0, 2: 0.0, 3: 0.0}
+
+# ---------------------------------------------------------------------------
+# Phase 1 — continuous (dense) progress rewards
+# R_step ≡ Σ (Δt / Duration_j) × PriorityWeight × contention_factor ; scaled below.
+# CONTENTION_REWARD_FACTOR scales the dense signal (1.0 = legacy-equivalent).
+# ---------------------------------------------------------------------------
+CONTENTION_REWARD_FACTOR = 1.0
+
+# ---------------------------------------------------------------------------
+# Phase 2 — opportunity cost (idle GPU "rent")
+# ---------------------------------------------------------------------------
+IDLE_GPU_BASE_RATE = 0.05          # queue empty
+IDLE_GPU_QUEUE_RATE = 0.20         # work waiting, moderate backlog
+IDLE_GPU_BACKLOG_RATE = 0.35       # len(queue) > IDLE_BACKLOG_THRESHOLD
+IDLE_BACKLOG_THRESHOLD = 5
+IDLE_PRIORITY_MULTIPLIER = 2.0     # extra pressure when P0/P1 are queued
+
+# ---------------------------------------------------------------------------
+# Phase 3 — quadratic SLA lateness + starvation
+# ---------------------------------------------------------------------------
+SLA_QUADRATIC_MULTIPLIER = 0.1
+MAX_SLA_PENALTY = 50.0             # per-step cap in scaled reward units
+MIN_PENALTY_HOURS = 0.5            # grace after missing deadline before quadratics bite
+SLA_LATE_CAP_HOURS = 12.0          # cap lateness before squaring (stability)
+STARVATION_THRESHOLD_HOURS = 48.0
+PRIORITY_ESCALATION_INTERVAL = 48.0
+STARVATION_PENALTY_SCALE = 1.0e-4  # quadratic in excess hours, scaled
+
+# ---------------------------------------------------------------------------
+# Phase 4 — fragmentation tax + sunk-cost preemption
+# ---------------------------------------------------------------------------
+FRAGMENTATION_PENALTY_SEVERE = 0.15    # free < 2 on a partially used node
+FRAGMENTATION_PENALTY_MODERATE = 0.08  # free < 4
+FRAGMENTATION_PENALTY_MILD = 0.03      # free < 8
+SUNK_COST_MULTIPLIER = 1.0             # scales (1 + progress) term in preemption burn
 
 # ---------------------------------------------------------------------------
 # Task configuration table
@@ -287,7 +328,6 @@ class GpuSchedulerEnvironment(Environment):
         self._cumulative_gpu_hrs_avail: float = 0.0
         self._compute_burn_usd:         float = 0.0
         self._cumulative_reward:        float = 0.0
-        self._sla_penalized_jobs:       set   = set()
 
         # Plain-English result of the last action (shown to the LLM each step)
         self._last_action_result: str = ""
@@ -343,7 +383,6 @@ class GpuSchedulerEnvironment(Environment):
         self._total_jobs_spawned       = 0
         self._sla_jobs_total           = 0
         self._sla_jobs_met             = 0.0
-        self._sla_penalized_jobs       = set()
         self._p0_job_completed         = False
         self._cumulative_gpu_hrs_used  = 0.0
         self._cumulative_gpu_hrs_avail = 0.0
@@ -567,8 +606,9 @@ class GpuSchedulerEnvironment(Environment):
         Immediately halt a running job and return it to the front of the queue.
 
         Applies two penalties:
-          1. Preemption Burn Penalty:
+          1. Preemption Burn Penalty (sunk-cost aware):
                gpu_count × wasted_hours × hourly_rate × PREEMPTION_BURN_MULTIPLIER
+               × (1 + progress × SUNK_COST_MULTIPLIER) × priority_protection
              where wasted_hours is capped at PREEMPTION_CHECKPOINT_HOURS (the
              assumed interval between checkpoints).
           2. Checkpoint Rollback:
@@ -599,13 +639,20 @@ class GpuSchedulerEnvironment(Environment):
             )
             return -0.5    # elevated penalty for even attempting this
 
+        # Sunk-cost awareness: more completed progress → higher burn (before rollback)
+        progress_before = job.progress
+        priority_protection = 1.0 + (2.0 - job.priority * 0.5)  # P1→2.5, P2→2.0, P3→1.5
+
         # --- Burn penalty: cost of wasted work since last checkpoint ---
         wasted_hours = min(job.elapsed_hours, PREEMPTION_CHECKPOINT_HOURS)
+        sunk_factor = 1.0 + progress_before * SUNK_COST_MULTIPLIER
         burn_penalty = (
             job.gpu_count
             * wasted_hours
             * HOURLY_RATE_PER_GPU
             * PREEMPTION_BURN_MULTIPLIER
+            * sunk_factor
+            * priority_protection
             * REWARD_SCALE
         )
 
@@ -644,14 +691,16 @@ class GpuSchedulerEnvironment(Environment):
         """
         Advance the simulation clock by `hours` and process all side effects.
 
-        Executes six operations in strict order to avoid clock-skew bugs:
-            1. Update progress for all running jobs (quadratic contention degradation)
-            2. Finalise completed jobs; award full or partial SLA credit
-            3. Advance the wall clock
-            4. Apply graduated SLA violation penalty for overdue jobs
-            5. Release newly-arrived jobs from the master schedule into the queue
-            6. Apply queue-delay penalty for P0/P1 jobs in queue;
-               deduct demand-scaled idle-GPU opportunity cost
+        Order (clock-skew safe):
+            1. Dense progress rewards — each step accrues (Δt/Duration)×priority×contention
+            2. Finalise completed jobs; SLA grader credit
+            3. Advance wall clock
+            4. Quadratic SLA lateness penalties (capped per step)
+            5. Release newly arrived jobs
+            6. Queue-delay penalty; accumulate hours_waiting / hours_in_queue
+            7. Graduated idle-GPU rent (queue-depth + P0/P1-aware)
+            8. Fragmentation tax on partially packed nodes
+            9. Starvation penalty for jobs waiting too long in queue
 
         Args:
             hours: Simulated hours to advance (1.0, 2.0, or 4.0 depending on task).
@@ -670,19 +719,32 @@ class GpuSchedulerEnvironment(Environment):
 
             # Smooth quadratic degradation: higher contention → lower speed
             progress_rate = 1.0 - CONTENTION_DEGRADATION * contention * contention
+            dur = max(job.duration_hours, 0.1)
 
-            delta             = (hours / job.duration_hours) * progress_rate
+            # Dense progress: Δprogress = (Δt / Duration) × contention_factor
+            delta = (hours / dur) * progress_rate
+            job.progress_this_step = delta
+            job.effective_rate     = progress_rate
+
             job.progress      = min(1.0, job.progress + delta)
             job.elapsed_hours += hours * progress_rate
 
-            # Progress reward weighted by job priority
-            reward += delta * PRIORITY_WEIGHTS[job.priority]
+            # Priority escalation: long-lived jobs gradually act like higher priority
+            esc = int(job.hours_waiting // PRIORITY_ESCALATION_INTERVAL)
+            eff_pri = max(0, min(3, job.priority - esc))
+
+            contention_factor = progress_rate
+            reward += (
+                (hours / dur)
+                * contention_factor
+                * PRIORITY_WEIGHTS[eff_pri]
+                * CONTENTION_REWARD_FACTOR
+            )
 
             if job.progress >= 1.0:
                 newly_completed.append(job_id)
 
         # 2. Finalise completed jobs BEFORE advancing the clock -------------------
-        #    This ensures the SLA deadline comparison uses the correct end-of-step time.
         old_hour = self._current_hour
         new_hour = min(old_hour + hours, self._total_hours)
 
@@ -690,7 +752,6 @@ class GpuSchedulerEnvironment(Environment):
             job           = self._active_jobs.pop(job_id)
             job.status    = "completed"
 
-            # Free the GPU slots this job held on each assigned node
             gpus_per_node = GPUS_PER_NODE if len(job.assigned_nodes) > 1 else job.gpu_count
             for n in job.assigned_nodes:
                 self._node_gpu_used[n] -= gpus_per_node
@@ -700,7 +761,6 @@ class GpuSchedulerEnvironment(Environment):
 
             self._completed_jobs.append(job)
 
-            # SLA compliance: full credit on-time, partial credit for slightly late
             if job.deadline_hour is not None:
                 if new_hour <= job.deadline_hour:
                     self._sla_jobs_met += 1.0
@@ -711,31 +771,28 @@ class GpuSchedulerEnvironment(Environment):
                     elif overdue <= 8.0:
                         self._sla_jobs_met += 0.25
 
-            # Track the special P0 emergency job for the hard-task grader
             if job_id == "job_P0_EMERGENCY":
                 self._p0_job_completed = True
 
         # 3. Advance the simulation clock -----------------------------------------
         self._current_hour = new_hour
 
-        # 4. SLA violations: graduated penalty for jobs past their deadline ---------
+        # 4. Quadratic SLA lateness (replaces fixed initial + linear continuing) --
         for job in list(self._active_jobs.values()) + list(self._queue):
             if job.deadline_hour and self._current_hour > job.deadline_hour:
-                if job.job_id not in self._sla_penalized_jobs:
-                    initial_penalty = (
-                        job.gpu_count
-                        * job.duration_hours
-                        * HOURLY_RATE_PER_GPU
-                        * 3.0
-                        * REWARD_SCALE
-                    )
-                    reward -= initial_penalty
-                    self._sla_penalized_jobs.add(job.job_id)
-                continuing_penalty = (
-                    job.gpu_count * hours * HOURLY_RATE_PER_GPU
-                    * 0.5 * REWARD_SCALE
+                hours_late = self._current_hour - job.deadline_hour
+                late_for_penalty = max(0.0, hours_late - MIN_PENALTY_HOURS)
+                if late_for_penalty <= 0.0:
+                    continue
+                capped_late = min(late_for_penalty, SLA_LATE_CAP_HOURS)
+                step_penalty = (
+                    (capped_late ** 2)
+                    * job.gpu_count
+                    * HOURLY_RATE_PER_GPU
+                    * SLA_QUADRATIC_MULTIPLIER
+                    * REWARD_SCALE
                 )
-                reward -= continuing_penalty
+                reward -= min(step_penalty, MAX_SLA_PENALTY)
 
         # 5. Release newly-arrived jobs into the visible queue --------------------
         self._release_arriving_jobs(from_hour=old_hour, to_hour=self._current_hour)
@@ -743,27 +800,52 @@ class GpuSchedulerEnvironment(Environment):
         # 6a. Queue-delay penalty for high-priority jobs left waiting -------------
         for job in self._queue:
             job.hours_in_queue += hours
+            job.hours_waiting  += hours
             factor = PRIORITY_QUEUE_FACTORS.get(job.priority, 0.0)
             if factor > 0.0:
-                # Small per-step nudge to dispatch critical jobs promptly
                 reward -= (
                     job.gpu_count * hours * factor
                     * HOURLY_RATE_PER_GPU * REWARD_SCALE * 0.1
                 )
 
-        # 6b. Idle-GPU opportunity cost: unused GPUs are wasted money -------------
+        for job in self._active_jobs.values():
+            job.hours_waiting += hours
+
+        # 6b. Idle-GPU opportunity cost (graduated rent) ---------------------------
         active_gpus = sum(self._node_gpu_used.values())
         idle_gpus   = TOTAL_GPUS - active_gpus
 
-        # Track cumulative utilisation for grader score computation
         self._cumulative_gpu_hrs_used  += active_gpus * hours
-        self._cumulative_gpu_hrs_avail += TOTAL_GPUS  * hours
-        self._compute_burn_usd         += TOTAL_GPUS  * hours * HOURLY_RATE_PER_GPU
+        self._cumulative_gpu_hrs_avail += TOTAL_GPUS * hours
+        self._compute_burn_usd         += TOTAL_GPUS * hours * HOURLY_RATE_PER_GPU
 
-        # Idle penalty: higher when schedulable work is waiting, low when queue is empty
-        has_pending_work = len(self._queue) > 0
-        idle_rate = 0.2 if has_pending_work else 0.05
-        reward -= idle_gpus * hours * HOURLY_RATE_PER_GPU * REWARD_SCALE * idle_rate
+        qlen = len(self._queue)
+        if qlen == 0:
+            idle_penalty_rate = IDLE_GPU_BASE_RATE
+        elif qlen <= IDLE_BACKLOG_THRESHOLD:
+            idle_penalty_rate = IDLE_GPU_QUEUE_RATE
+        else:
+            idle_penalty_rate = IDLE_GPU_BACKLOG_RATE
+
+        if any(j.priority <= 1 for j in self._queue):
+            idle_penalty_rate *= IDLE_PRIORITY_MULTIPLIER
+
+        reward -= idle_gpus * hours * HOURLY_RATE_PER_GPU * REWARD_SCALE * idle_penalty_rate
+
+        # 6c. Fragmentation tax ----------------------------------------------------
+        reward -= self._calculate_fragmentation_penalty(hours)
+
+        # 6d. Starvation — queued jobs waiting beyond threshold --------------------
+        for job in self._queue:
+            if job.hours_waiting > STARVATION_THRESHOLD_HOURS:
+                excess = job.hours_waiting - STARVATION_THRESHOLD_HOURS
+                starve = (
+                    (excess ** 2)
+                    * job.gpu_count
+                    * STARVATION_PENALTY_SCALE
+                    * REWARD_SCALE
+                )
+                reward -= min(starve, MAX_SLA_PENALTY)
 
         return reward
 
@@ -822,6 +904,73 @@ class GpuSchedulerEnvironment(Environment):
         return sum(
             self._node_gpu_used[n] / GPUS_PER_NODE for n in node_ids
         ) / len(node_ids)
+
+    def _calculate_fragmentation_penalty(self, hours: float) -> float:
+        """
+        Phase 4a — penalise partially used nodes that cannot fit common shapes
+        (e.g. a full 8-GPU task), encouraging cleaner packing for gang jobs.
+        """
+        penalty = 0.0
+        for node_id in range(NUM_NODES):
+            free = self._get_free_gpus(node_id)
+            used = self._node_gpu_used[node_id]
+            if not (0 < free < GPUS_PER_NODE):
+                continue
+            used_term = max(used, 1)
+            if free < 2:
+                penalty += FRAGMENTATION_PENALTY_SEVERE * used_term
+            elif free < 4:
+                penalty += FRAGMENTATION_PENALTY_MODERATE * used_term
+            else:
+                penalty += FRAGMENTATION_PENALTY_MILD * used_term
+        return penalty * hours * HOURLY_RATE_PER_GPU * REWARD_SCALE
+
+    def _obs_node_fragmentation_score(self, node_id: int) -> float:
+        """Observation-only heuristic matching fragmentation tax tiers."""
+        free = self._get_free_gpus(node_id)
+        if free == 0 or free == GPUS_PER_NODE:
+            return 0.0
+        if free < 2:
+            return FRAGMENTATION_PENALTY_SEVERE
+        if free < 4:
+            return FRAGMENTATION_PENALTY_MODERATE
+        return FRAGMENTATION_PENALTY_MILD
+
+    def _validate_reward_mechanism(self) -> Dict[str, bool]:
+        """
+        Static checks that reward/penalty hyperparameters are internally consistent.
+
+        Use in tests or debugging — not invoked every env step.
+        """
+        checks: Dict[str, bool] = {}
+        checks["priority_dominance"] = PRIORITY_WEIGHTS[0] > PRIORITY_WEIGHTS[3]
+        checks["idle_rates_ordered"] = (
+            IDLE_GPU_BASE_RATE < IDLE_GPU_QUEUE_RATE
+            and IDLE_GPU_QUEUE_RATE <= IDLE_GPU_BACKLOG_RATE
+        )
+        # WAIT with backlog should cost more idle rent than with an empty queue
+        checks["wait_worse_with_queue"] = IDLE_GPU_BASE_RATE < IDLE_GPU_QUEUE_RATE
+
+        # Symmetry sketch: burning GPU-hours via preemption should dominate
+        # a single nominal progress step for a comparable job (same priority weight).
+        dur = 10.0
+        hours = 1.0
+        gpu = 4
+        prog = 0.5
+        progress_gain = (hours / dur) * PRIORITY_WEIGHTS[1]
+        wasted = min(hours, PREEMPTION_CHECKPOINT_HOURS)
+        prio_mult = 1.0 + (2.0 - 1 * 0.5)
+        burn = (
+            gpu
+            * wasted
+            * HOURLY_RATE_PER_GPU
+            * PREEMPTION_BURN_MULTIPLIER
+            * (1.0 + prog * SUNK_COST_MULTIPLIER)
+            * prio_mult
+            * REWARD_SCALE
+        )
+        checks["preemption_exceeds_small_progress"] = burn > progress_gain * 0.25
+        return checks
 
     def _all_work_done(self) -> bool:
         """
@@ -941,18 +1090,22 @@ class GpuSchedulerEnvironment(Environment):
                 gpu_slot += gpus
             grid.append(row)
 
-        # --- Per-node NodeInfo with live contention ---
-        nodes: List[NodeInfo] = [
-            NodeInfo(
-                node_id           = n,
-                total_gpus        = GPUS_PER_NODE,
-                used_gpus         = self._node_gpu_used[n],
-                free_gpus         = self._get_free_gpus(n),
-                memory_contention = round(self._node_gpu_used[n] / GPUS_PER_NODE, 3),
-                running_jobs      = list(self._node_jobs[n]),
+        # --- Per-node NodeInfo with live contention + fragmentation hints ---
+        nodes: List[NodeInfo] = []
+        for n in range(NUM_NODES):
+            free_n = self._get_free_gpus(n)
+            nodes.append(
+                NodeInfo(
+                    node_id                 = n,
+                    total_gpus              = GPUS_PER_NODE,
+                    used_gpus               = self._node_gpu_used[n],
+                    free_gpus               = free_n,
+                    largest_contiguous_free = free_n,
+                    memory_contention       = round(self._node_gpu_used[n] / GPUS_PER_NODE, 3),
+                    fragmentation_score     = round(self._obs_node_fragmentation_score(n), 4),
+                    running_jobs            = list(self._node_jobs[n]),
+                )
             )
-            for n in range(NUM_NODES)
-        ]
 
         # --- Metadata: always include episode stats; inject score when terminal ---
         meta: Dict[str, Any] = {
