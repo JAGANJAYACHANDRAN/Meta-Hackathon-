@@ -63,6 +63,7 @@ from gpu_scheduler import (
     GpuSchedulerAction,
     GpuSchedulerEnv,
     GpuSchedulerObservation,
+    JobInfo,
 )
 
 # ---------------------------------------------------------------------------
@@ -91,6 +92,55 @@ TASKS: List[Tuple[str, int, float]] = [
 # LLM sampling config — lower temperature = more deterministic scheduling
 TEMPERATURE = 0.3
 MAX_TOKENS  = 200   # Enough for action line + brief chain-of-thought
+
+# Must match gpu_scheduler_environment.NUM_NODES / GPUS_PER_NODE
+_NUM_NODES = 8
+_GPUS_PER_NODE = 8
+
+
+def _nodes_needed_for_job(gpu_count: int) -> int:
+    return (gpu_count + _GPUS_PER_NODE - 1) // _GPUS_PER_NODE
+
+
+def _find_schedule_anchor(job: JobInfo, obs: GpuSchedulerObservation) -> Optional[int]:
+    """
+    Return a node_id that can legally anchor SCHEDULE for this job, or None.
+
+    Single-node jobs: any node with enough free GPUs.
+    Gang jobs (gpu_count > 8): need N fully-free nodes; returns one of them as anchor.
+    """
+    if job.gpu_count <= _GPUS_PER_NODE:
+        for node in sorted(obs.nodes, key=lambda n: (-n.free_gpus, n.node_id)):
+            if node.free_gpus >= job.gpu_count:
+                return node.node_id
+        return None
+
+    need = _nodes_needed_for_job(job.gpu_count)
+    fully_free = [n for n in obs.nodes if n.free_gpus == _GPUS_PER_NODE]
+    if len(fully_free) < need:
+        return None
+    fully_free.sort(key=lambda n: n.node_id)
+    return fully_free[0].node_id
+
+
+def _proposed_schedule_valid(
+    job: JobInfo,
+    node_id: Optional[int],
+    obs: GpuSchedulerObservation,
+) -> bool:
+    """True if SCHEDULE(job, node_id) would satisfy environment placement rules."""
+    if node_id is None or node_id not in range(_NUM_NODES):
+        return False
+    if job.gpu_count <= _GPUS_PER_NODE:
+        node = next((n for n in obs.nodes if n.node_id == node_id), None)
+        return node is not None and node.free_gpus >= job.gpu_count
+
+    need = _nodes_needed_for_job(job.gpu_count)
+    fully_free_ct = sum(1 for n in obs.nodes if n.free_gpus == _GPUS_PER_NODE)
+    if fully_free_ct < need:
+        return False
+    node = next((n for n in obs.nodes if n.node_id == node_id), None)
+    return node is not None and node.free_gpus == _GPUS_PER_NODE
 
 
 # ---------------------------------------------------------------------------
@@ -292,10 +342,12 @@ def parse_action(response: str) -> GpuSchedulerAction:
     Reads only the first line of the response (the rest is optional reasoning).
     Falls back to WAIT on any parse failure so the episode never crashes.
 
-    Patterns recognised (case-insensitive):
+    Patterns recognised (case-insensitive for keywords; job_id casing preserved):
         SCHEDULE <job_id> <node_id>
         PREEMPT  <job_id>
         WAIT
+
+    Also tolerates leading filler text on line 1 when SCHEDULE/PREEMPT appears later.
 
     Args:
         response: Raw string from the LLM completion.
@@ -303,33 +355,78 @@ def parse_action(response: str) -> GpuSchedulerAction:
     Returns:
         A valid GpuSchedulerAction — never raises.
     """
-    # Only parse the first line; ignore chain-of-thought below it
     first_line = response.strip().split("\n")[0].strip()
 
-    # SCHEDULE job_id node_id
+    # Strict: line starts with SCHEDULE …
     m = re.match(r"SCHEDULE\s+(\S+)\s+(\d+)", first_line, re.IGNORECASE)
     if m:
         return GpuSchedulerAction(
             action_type="SCHEDULE",
-            job_id=m.group(1).lower(),
+            job_id=m.group(1),
             node_id=int(m.group(2)),
         )
 
-    # PREEMPT job_id
+    # SCHEDULE anywhere on first line (e.g. "Ok, SCHEDULE job_000 3")
+    m = re.search(r"SCHEDULE\s+(\S+)\s+(\d+)", first_line, re.IGNORECASE)
+    if m:
+        return GpuSchedulerAction(
+            action_type="SCHEDULE",
+            job_id=m.group(1),
+            node_id=int(m.group(2)),
+        )
+
+    # Loose: "schedule" + job_id + trailing node index (last integer on the line)
+    if "schedule" in first_line.lower():
+        jm = re.search(r"(job_[A-Za-z0-9_]+)", first_line)
+        nm = re.search(r"(\d+)\s*$", first_line.strip())
+        if jm and nm:
+            return GpuSchedulerAction(
+                action_type="SCHEDULE",
+                job_id=jm.group(1),
+                node_id=int(nm.group(1)),
+            )
+
     m = re.match(r"PREEMPT\s+(\S+)", first_line, re.IGNORECASE)
     if m:
         return GpuSchedulerAction(
             action_type="PREEMPT",
-            job_id=m.group(1).lower(),
+            job_id=m.group(1),
         )
 
-    # WAIT (or anything else — safe default)
+    m = re.search(r"PREEMPT\s+(\S+)", first_line, re.IGNORECASE)
+    if m:
+        return GpuSchedulerAction(
+            action_type="PREEMPT",
+            job_id=m.group(1),
+        )
+
+    if "preempt" in first_line.lower():
+        jm = re.search(r"(job_[A-Za-z0-9_]+)", first_line)
+        if jm:
+            return GpuSchedulerAction(
+                action_type="PREEMPT",
+                job_id=jm.group(1),
+            )
+
     return GpuSchedulerAction(action_type="WAIT")
 
 
 # ---------------------------------------------------------------------------
 # LLM call — builds the full prompt and returns (action, raw_response)
 # ---------------------------------------------------------------------------
+
+def _first_placeable_schedule(obs: GpuSchedulerObservation) -> Optional[GpuSchedulerAction]:
+    """Pick highest-priority job that can be placed now; return SCHEDULE action or None."""
+    for job in sorted(obs.queue, key=lambda j: (j.priority, -j.hours_in_queue)):
+        anchor = _find_schedule_anchor(job, obs)
+        if anchor is not None:
+            return GpuSchedulerAction(
+                action_type="SCHEDULE",
+                job_id=job.job_id,
+                node_id=anchor,
+            )
+    return None
+
 
 def validate_action(
     action: GpuSchedulerAction,
@@ -338,42 +435,33 @@ def validate_action(
     """
     Validate an LLM-proposed action against the current observation.
 
-    If the action references an invalid job_id (not in queue) or an
-    invalid node (not enough free GPUs), attempt to auto-correct by
-    scheduling the highest-priority queued job on the best available node.
-    Falls back to WAIT if no valid scheduling is possible.
+    If the action is invalid or WAIT while a queued job could start, auto-correct
+    to a legal SCHEDULE (including correct gang-job anchors).
     """
     queue_ids = {job.job_id for job in obs.queue}
-    free_by_node = {n.node_id: n.free_gpus for n in obs.nodes}
 
     if action.action_type == "SCHEDULE":
         job_valid = action.job_id in queue_ids
-        node_valid = (
-            action.node_id is not None
-            and action.node_id in free_by_node
-            and free_by_node[action.node_id] > 0
-        )
-        if job_valid and node_valid:
-            return action
+        if job_valid:
+            job = next(j for j in obs.queue if j.job_id == action.job_id)
+            if _proposed_schedule_valid(job, action.node_id, obs):
+                return action
 
-        # Auto-correct: pick highest-priority queued job + best node
-        if obs.queue:
-            best_job = sorted(obs.queue, key=lambda j: (j.priority, -j.hours_in_queue))[0]
-            best_node = max(obs.nodes, key=lambda n: n.free_gpus)
-            if best_node.free_gpus >= best_job.gpu_count:
-                return GpuSchedulerAction(
-                    action_type="SCHEDULE",
-                    job_id=best_job.job_id,
-                    node_id=best_node.node_id,
-                )
-
-        return GpuSchedulerAction(action_type="WAIT")
+        fallback = _first_placeable_schedule(obs)
+        return fallback if fallback is not None else GpuSchedulerAction(action_type="WAIT")
 
     if action.action_type == "PREEMPT":
         running_ids = {job.job_id for job in obs.active_jobs}
         if action.job_id in running_ids:
             return action
-        return GpuSchedulerAction(action_type="WAIT")
+        fallback = _first_placeable_schedule(obs)
+        return fallback if fallback is not None else GpuSchedulerAction(action_type="WAIT")
+
+    # WAIT — override when at least one queued job can be placed (idle GPUs + fit)
+    if action.action_type == "WAIT" and obs.queue:
+        fallback = _first_placeable_schedule(obs)
+        if fallback is not None:
+            return fallback
 
     return action
 
@@ -412,8 +500,16 @@ def get_llm_action(
             stream=False,
         )
         raw = (completion.choices[0].message.content or "WAIT").strip()
-        action = parse_action(raw)
-        action = validate_action(action, obs)
+        parsed = parse_action(raw)
+        action = validate_action(parsed, obs)
+        if os.getenv("GPU_SCHEDULER_DEBUG_INFERENCE"):
+            p = parsed.action_type
+            print(
+                f"[DEBUG inference] step={step} raw_1l={raw.splitlines()[0]!r} "
+                f"parsed={p} validated={action.action_type} "
+                f"job_id={action.job_id} node_id={action.node_id}",
+                flush=True,
+            )
         return action, raw
 
     except Exception as exc:
