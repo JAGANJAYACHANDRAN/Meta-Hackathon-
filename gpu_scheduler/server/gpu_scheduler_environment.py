@@ -106,6 +106,20 @@ TASK_CONFIGS: Dict[str, Dict] = {
         "seed":            999,
         "description":     "One-week run. A 32-GPU P0 job arrives at hour 72. Plan ahead.",
     },
+    "batch_priority_inversion": {
+        "total_hours":     48.0,
+        "hours_per_step":   2.0,    # 24 agent steps total
+        "lookahead_hours":  8.0,
+        "seed":            777,
+        "description":     "48h with P3 background load and bursty P1 arrivals.",
+    },
+    "batch_gang_scheduling": {
+        "total_hours":     96.0,
+        "hours_per_step":   3.0,    # 32 agent steps total
+        "lookahead_hours": 15.0,
+        "seed":           2048,
+        "description":     "96h with dual P0 gang jobs requiring node reservation.",
+    },
 }
 
 
@@ -223,6 +237,128 @@ def _generate_job_schedule(task_name: str, rng: random.Random) -> List[Dict]:
         })
 
         # Re-sort after injecting the emergency job (it may not be the last entry)
+        jobs.sort(key=lambda j: j["arrival_hour"])
+
+    elif task_name == "batch_priority_inversion":
+        # 48h scenario: P3 jobs occupy cluster, then bursty P1 arrivals with tight deadlines.
+        # Agent must use BATCH to atomically preempt P3s and schedule P1s.
+        
+        # Phase 1: 8 P3 jobs arrive early (hours 0-4) to occupy cluster
+        p3_arrivals = [0, 0, 1, 1, 2, 3, 3, 4]
+        for hour in p3_arrivals:
+            gpu_count = rng.choice([2, 2, 4, 4])
+            duration  = round(rng.uniform(12.0, 24.0), 1)  # Long-running to create pressure
+            jobs.append({
+                "job_id":         _make_job_id(idx),
+                "priority":       3,
+                "priority_label": "P3",
+                "gpu_count":      gpu_count,
+                "duration_hours": duration,
+                "deadline_hour":  None,  # P3 spot jobs have no SLA
+                "arrival_hour":   float(hour),
+            })
+            idx += 1
+        
+        # Phase 2: 10 P1 jobs with tight deadlines (hours 12-20)
+        p1_arrivals = sorted(rng.uniform(12.0, 20.0) for _ in range(10))
+        for hour in p1_arrivals:
+            gpu_count = rng.choice([4, 4, 6, 8, 8])
+            duration  = round(rng.uniform(4.0, 8.0), 1)
+            # Tight deadlines: 5-8h from arrival
+            deadline  = round(hour + duration + rng.uniform(5.0, 8.0), 1)
+            jobs.append({
+                "job_id":         _make_job_id(idx),
+                "priority":       1,
+                "priority_label": "P1",
+                "gpu_count":      gpu_count,
+                "duration_hours": duration,
+                "deadline_hour":  deadline,
+                "arrival_hour":   round(hour, 1),
+            })
+            idx += 1
+        
+        # Phase 3: 6 P2 jobs scattered throughout for complexity
+        p2_arrivals = sorted(rng.uniform(6.0, 42.0) for _ in range(6))
+        for hour in p2_arrivals:
+            gpu_count = rng.choice([2, 2, 4])
+            duration  = round(rng.uniform(6.0, 14.0), 1)
+            has_dl    = rng.random() < 0.5
+            deadline  = round(hour + duration + rng.uniform(8.0, 12.0), 1) if has_dl else None
+            jobs.append({
+                "job_id":         _make_job_id(idx),
+                "priority":       2,
+                "priority_label": "P2",
+                "gpu_count":      gpu_count,
+                "duration_hours": duration,
+                "deadline_hour":  deadline,
+                "arrival_hour":   round(hour, 1),
+            })
+            idx += 1
+        
+        jobs.sort(key=lambda j: j["arrival_hour"])
+
+    elif task_name == "batch_gang_scheduling":
+        # 96h scenario: Two P0 gang jobs require multi-node capacity reservation.
+        # Agent must use BATCH to free entire nodes while maintaining SLAs.
+        
+        # Background load: 20 P2/P3 jobs scattered hours 0-90
+        background_arrivals = sorted(rng.uniform(0.0, 90.0) for _ in range(20))
+        for hour in background_arrivals:
+            gpu_count = rng.choice([1, 2, 2, 4, 4])
+            priority  = rng.choice([2, 2, 2, 3, 3])
+            duration  = round(rng.uniform(8.0, 36.0), 1)
+            has_dl    = rng.random() < 0.4
+            deadline  = round(hour + duration + rng.uniform(6.0, 18.0), 1) if has_dl else None
+            jobs.append({
+                "job_id":         _make_job_id(idx),
+                "priority":       priority,
+                "priority_label": f"P{priority}",
+                "gpu_count":      gpu_count,
+                "duration_hours": duration,
+                "deadline_hour":  deadline,
+                "arrival_hour":   round(hour, 1),
+            })
+            idx += 1
+        
+        # First gang job: 16-GPU P0 at hour 24, deadline hour 60
+        jobs.append({
+            "job_id":         "job_GANG_01",
+            "priority":       0,
+            "priority_label": "P0",
+            "gpu_count":      16,
+            "duration_hours": 24.0,
+            "deadline_hour":  60.0,  # 24 + 24 + 12h grace
+            "arrival_hour":   24.0,
+        })
+        
+        # Second gang job: 24-GPU P0 at hour 60, deadline hour 108
+        jobs.append({
+            "job_id":         "job_GANG_02",
+            "priority":       0,
+            "priority_label": "P0",
+            "gpu_count":      24,
+            "duration_hours": 30.0,
+            "deadline_hour":  108.0,  # 60 + 30 + 18h grace
+            "arrival_hour":   60.0,
+        })
+        
+        # 5 P1 jobs with deadlines between gang jobs for added pressure
+        p1_arrivals = sorted(rng.uniform(30.0, 75.0) for _ in range(5))
+        for hour in p1_arrivals:
+            gpu_count = rng.choice([2, 4, 4, 6])
+            duration  = round(rng.uniform(6.0, 12.0), 1)
+            deadline  = round(hour + duration + rng.uniform(6.0, 10.0), 1)
+            jobs.append({
+                "job_id":         _make_job_id(idx),
+                "priority":       1,
+                "priority_label": "P1",
+                "gpu_count":      gpu_count,
+                "duration_hours": duration,
+                "deadline_hour":  deadline,
+                "arrival_hour":   round(hour, 1),
+            })
+            idx += 1
+        
         jobs.sort(key=lambda j: j["arrival_hour"])
 
     return jobs
@@ -936,6 +1072,35 @@ class GpuSchedulerEnvironment(Environment):
         elif self._task_name == "p0_emergency":
             p0_done = 1.0 if self._p0_job_completed else 0.0
             score   = 0.5 * p0_done + 0.3 * sla_rate + 0.2 * utilisation
+
+        elif self._task_name == "batch_priority_inversion":
+            # Grader for batch priority inversion: 70% SLA compliance + 30% preemption efficiency
+            # Penalize excessive preemptions (agent should be strategic)
+            preemption_count = len(self._preempted_jobs)
+            preemption_cost = min(preemption_count * 0.1, 1.0)  # Cap at 1.0
+            preemption_efficiency = max(0.0, 1.0 - preemption_cost)
+            score = 0.7 * sla_rate + 0.3 * preemption_efficiency
+
+        elif self._task_name == "batch_gang_scheduling":
+            # Grader for gang scheduling: 40% gang completion + 30% SLA + 20% util + 10% efficiency
+            # Count gang jobs (gpu_count >= 16) that completed
+            gang_jobs_completed = sum(1 for j in self._completed_jobs if j.gpu_count >= 16)
+            gang_completion_rate = gang_jobs_completed / 2.0  # 2 gang jobs total
+            
+            # Preemption waste: how much work was wasted on preempted jobs
+            if self._preempted_jobs:
+                total_wasted = sum(j.elapsed_hours for j in self._preempted_jobs)
+                total_durations = sum(j.duration_hours for j in self._preempted_jobs)
+                preemption_waste = total_wasted / max(total_durations, 1.0)
+            else:
+                preemption_waste = 0.0
+            
+            score = (
+                0.4 * gang_completion_rate +
+                0.3 * sla_rate +
+                0.2 * utilisation +
+                0.1 * (1.0 - preemption_waste)
+            )
 
         else:
             score = completion_rate    # safe fallback for unknown tasks

@@ -161,6 +161,8 @@ TASKS: List[Tuple[str, int, float]] = [
     ("smooth_sailing",  24, 0.40),   # Easy:   24h sim,  1 h/step
     ("deadline_crunch", 36, 0.35),   # Medium: 72h sim,  2 h/step
     ("p0_emergency",    42, 0.30),   # Hard:  168h sim,  4 h/step
+    ("batch_priority_inversion", 24, 0.50),  # Hard:  48h sim,  2 h/step
+    ("batch_gang_scheduling", 32, 0.55),     # Hard:  96h sim,  3 h/step
 ]
 
 # LLM sampling config — lower temperature = more deterministic scheduling

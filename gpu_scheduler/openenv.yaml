@@ -129,6 +129,30 @@ tasks:
     success_threshold: 0.30
     seed: 999
 
+  - name: batch_priority_inversion
+    difficulty: hard
+    description: >
+      48-hour scenario testing atomic batch preemption. P3 background jobs occupy
+      the cluster when multiple P1 jobs with tight deadlines arrive. Agent must use
+      BATCH actions to preempt multiple low-priority jobs and schedule high-priority
+      work atomically to avoid idle-GPU penalties. Grader: 70% SLA compliance + 30% preemption efficiency.
+    episode_length: 48
+    agent_steps: 24           # 2 h/step
+    success_threshold: 0.50
+    seed: 777
+
+  - name: batch_gang_scheduling
+    difficulty: hard
+    description: >
+      96-hour multi-gang scheduling challenge. Two P0 gang jobs (16-GPU at h24, 24-GPU at h60)
+      require proactive node capacity reservation via BATCH operations. Agent must coordinate
+      preempting multiple jobs to free entire nodes while maintaining P1 SLAs and utilization.
+      Grader: 40% gang completion + 30% SLA + 20% utilization + 10% preemption efficiency.
+    episode_length: 96
+    agent_steps: 32           # 3 h/step
+    success_threshold: 0.55
+    seed: 2048
+
 # ---------------------------------------------------------------------------
 # Environment variables required at runtime
 # ---------------------------------------------------------------------------
