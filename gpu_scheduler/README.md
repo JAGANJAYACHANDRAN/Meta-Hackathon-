@@ -43,7 +43,7 @@ Each node exposes a **memory contention** metric. When GPU utilisation exceeds 7
 | Action | Parameters | Description |
 |---|---|---|
 | `SCHEDULE` | `job_id`, `node_id` | Place a queued job on a node (0–7). Jobs needing >8 GPUs auto-span multiple fully-free nodes. |
-| `PREEMPT` | `job_id` | Evict a running job. Costs 2× wasted checkpoint work + up to 2h progress rollback. P0 jobs cannot be preempted. |
+| `PREEMPT` | `job_id` | Evict a running job. Incurs a burn penalty (pulls step reward toward 0) + up to 2h progress rollback. P0 jobs cannot be preempted. |
 | `WAIT` | — | Advance the simulation clock without scheduling. |
 | `BATCH` | `sub_actions[]` | Execute multiple SCHEDULE/PREEMPT actions **atomically within one timestep**. The clock advances only once after all sub-actions complete. |
 
@@ -208,7 +208,7 @@ The baseline `inference.py` runs an LLM agent against all three tasks sequential
 [END] success=true steps=36 score=0.487 rewards=...
 
 [START] task=p0_emergency env=gpu_scheduler model=Qwen/Qwen2.5-72B-Instruct
-[STEP] step=18 action=BATCH[PREEMPT job_003, PREEMPT job_008, SCHEDULE job_020 0] reward=-1.24 done=false error=null
+[STEP] step=18 action=BATCH[PREEMPT job_003, PREEMPT job_008, SCHEDULE job_020 0] reward=0.31 done=false error=null
 ...
 [END] success=false steps=42 score=0.284 rewards=...
 ```
