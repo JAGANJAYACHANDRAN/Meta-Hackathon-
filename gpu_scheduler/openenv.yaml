@@ -3,7 +3,7 @@ name: gpu_scheduler
 type: space
 runtime: fastapi
 app: server.app:app
-port: 8000
+port: 7860
 
 # ---------------------------------------------------------------------------
 # Environment metadata
@@ -84,7 +84,7 @@ observation:
       description: "Cumulative cluster operating cost in USD this episode."
     task_name:
       type: string
-      description: "Active task: smooth_sailing | deadline_crunch | p0_emergency"
+      description: "Active task: smooth_sailing | deadline_crunch | p0_emergency | batch_priority_inversion | batch_gang_scheduling"
     last_action_result:
       type: string
       description: "Plain-English feedback on the agent's last action (errors included)."
