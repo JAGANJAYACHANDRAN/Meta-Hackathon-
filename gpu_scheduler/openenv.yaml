@@ -36,11 +36,12 @@ action:
   properties:
     action_type:
       type: string
-      enum: [SCHEDULE, PREEMPT, WAIT]
+      enum: [SCHEDULE, PREEMPT, WAIT, BATCH]
       description: >
         SCHEDULE — place a queued job on a node.
         PREEMPT  — evict a running job (large burn penalty).
         WAIT     — advance the clock without scheduling.
+        BATCH    — execute multiple SCHEDULE/PREEMPT actions atomically in one timestep.
     job_id:
       type: string
       description: "Job identifier (required for SCHEDULE and PREEMPT)."
@@ -51,6 +52,25 @@ action:
       maximum: 7
       description: "Target node index 0–7 (required for SCHEDULE)."
       nullable: true
+    sub_actions:
+      type: array
+      description: >
+        List of sub-actions for BATCH action_type. Each sub-action has
+        action_type (SCHEDULE or PREEMPT), job_id, and optionally node_id.
+        All sub-actions execute atomically — the clock advances only once.
+      items:
+        type: object
+        properties:
+          action_type:
+            type: string
+            enum: [SCHEDULE, PREEMPT]
+          job_id:
+            type: string
+          node_id:
+            type: integer
+            minimum: 0
+            maximum: 7
+            nullable: true
   required:
     - action_type
 
@@ -72,7 +92,10 @@ observation:
       description: "All currently running jobs with progress, priority, and assigned nodes."
     queue:
       type: array
-      description: "Jobs waiting to be scheduled (includes ~4h lookahead of arrivals)."
+      description: "Jobs waiting to be scheduled (ready to place now)."
+    upcoming_jobs:
+      type: array
+      description: "Preview of jobs arriving within the lookahead window (NOT yet schedulable)."
     current_hour:
       type: number
       description: "Simulated wall-clock hours elapsed since episode start."
@@ -88,6 +111,10 @@ observation:
     last_action_result:
       type: string
       description: "Plain-English feedback on the agent's last action (errors included)."
+    score:
+      type: number
+      nullable: true
+      description: "Normalised grader score in [0.0, 1.0]. Only populated when done=True."
 
 # ---------------------------------------------------------------------------
 # Tasks — each defines a distinct episode with its own grader
@@ -137,6 +164,17 @@ env_vars:
     description: "Which task to run on reset(). Set by inference.py before each episode."
     default: "smooth_sailing"
     required: false
+  API_BASE_URL:
+    description: "The API endpoint for the LLM used by inference.py."
+    default: "https://router.huggingface.co/v1"
+    required: false
+  MODEL_NAME:
+    description: "The model identifier to use for inference."
+    default: "Qwen/Qwen2.5-72B-Instruct"
+    required: false
+  HF_TOKEN:
+    description: "HuggingFace / API key for LLM access."
+    required: true
 
 # ---------------------------------------------------------------------------
 # Infrastructure constraints
