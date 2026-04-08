@@ -64,13 +64,15 @@ from typing import Dict, List, Optional, TextIO, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Load .env file as fallback — override=False ensures that env vars already
-# set by the validator (API_BASE_URL, API_KEY) are NOT overwritten by .env.
+# Load .env ONLY as a local-dev convenience — never in the validator.
+# The validator injects API_BASE_URL and API_KEY directly into os.environ.
+# override=False ensures injected vars are never overwritten.
 _script_dir = Path(__file__).resolve().parent
 _env_path = _script_dir / ".env"
 if not _env_path.exists():
     _env_path = _script_dir / "gpu_scheduler" / ".env"
-load_dotenv(_env_path, override=False)
+if _env_path.exists():
+    load_dotenv(_env_path, override=False)
 
 # Import typed client + models from the gpu_scheduler package
 from gpu_scheduler import (
@@ -81,14 +83,27 @@ from gpu_scheduler import (
 )
 
 # ---------------------------------------------------------------------------
-# Environment variables — validator-injected values take priority over .env
+# Environment variables — resolved lazily via helpers so validator-injected
+# values always win, even if set after module import.
 # ---------------------------------------------------------------------------
 _DEFAULT_HF_SPACE = "https://PACMAN8055-gpu-scheduler-env.hf.space"
-IMAGE_NAME   = os.getenv("IMAGE_NAME", _DEFAULT_HF_SPACE)
-API_KEY      = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 BENCHMARK    = "gpu_scheduler"
+
+
+def _get_api_key() -> str:
+    return os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or ""
+
+
+def _get_api_base_url() -> str:
+    return os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+
+
+def _get_model_name() -> str:
+    return os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+
+
+def _get_image_name() -> str:
+    return os.environ.get("IMAGE_NAME", _DEFAULT_HF_SPACE)
 
 # Mirror stdout to a log file (see module docstring)
 _INFERENCE_LOG_FP: Optional[TextIO] = None
@@ -672,7 +687,7 @@ def get_llm_actions(
 
     try:
         completion = client.chat.completions.create(
-            model=MODEL_NAME,
+            model=_get_model_name(),
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
@@ -995,7 +1010,7 @@ async def run_task(
     preempt_history: Dict[str, int] = {}
     PREEMPT_COOLDOWN = 5  # blocks re-preemption for 5 steps
 
-    log_start(task=task_name, env_name=BENCHMARK, model=MODEL_NAME)
+    log_start(task=task_name, env_name=BENCHMARK, model=_get_model_name())
 
     try:
         result = await env.reset(task_name=task_name)
@@ -1173,9 +1188,15 @@ async def main() -> None:
         print(f"[LOG] Full run output also written to: {log_path}", flush=True)
 
     try:
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+        api_base = _get_api_base_url()
+        api_key = _get_api_key()
+        model = _get_model_name()
+        print(f"[INFO] LLM endpoint: {api_base}", flush=True)
+        print(f"[INFO] LLM model: {model}", flush=True)
+        print(f"[INFO] API_KEY set: {bool(api_key)}", flush=True)
+        client = OpenAI(base_url=api_base, api_key=api_key)
 
-        base_url = _resolve_base_url(IMAGE_NAME)
+        base_url = _resolve_base_url(_get_image_name())
         print(f"[INFO] Connecting to environment at: {base_url}", flush=True)
         env = GpuSchedulerEnv(base_url=base_url)
 
