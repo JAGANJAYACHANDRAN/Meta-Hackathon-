@@ -107,12 +107,15 @@ class GpuSchedulerEnv(
             NodeInfo(**n) for n in obs_data.get("nodes", [])
         ]
 
-        # --- Reconstruct active jobs and queue ---
+        # --- Reconstruct active jobs, queue, and upcoming ---
         active_jobs = [
             JobInfo(**j) for j in obs_data.get("active_jobs", [])
         ]
         queue = [
             JobInfo(**j) for j in obs_data.get("queue", [])
+        ]
+        upcoming_jobs = [
+            JobInfo(**j) for j in obs_data.get("upcoming_jobs", [])
         ]
 
         # --- Build the full observation object ---
@@ -121,6 +124,7 @@ class GpuSchedulerEnv(
             nodes=nodes,
             active_jobs=active_jobs,
             queue=queue,
+            upcoming_jobs=upcoming_jobs,
             current_hour=obs_data.get("current_hour", 0.0),
             total_hours=obs_data.get("total_hours", 24.0),
             compute_burn_so_far=obs_data.get("compute_burn_so_far", 0.0),

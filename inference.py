@@ -51,6 +51,7 @@ OPTIONAL LOG FILE (full stdout mirror for inspection)
                          gpu_scheduler/logs/inference_YYYYMMDD_HHMMSS.log
 """
 
+import argparse
 import asyncio
 import os
 import re
@@ -81,7 +82,8 @@ from gpu_scheduler import (
 # ---------------------------------------------------------------------------
 # Environment variables — loaded from .env file or shell environment
 # ---------------------------------------------------------------------------
-IMAGE_NAME   = os.getenv("IMAGE_NAME")          # HF Space URL or Docker image
+_DEFAULT_HF_SPACE = "https://PACMAN8055-gpu-scheduler-env.hf.space"
+IMAGE_NAME   = os.getenv("IMAGE_NAME", _DEFAULT_HF_SPACE)
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
@@ -1121,17 +1123,50 @@ async def run_task(
 # Main entry point — runs all three tasks sequentially
 # ---------------------------------------------------------------------------
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="GPUScheduler-Env inference agent")
+    valid_task_names = [t[0] for t in TASKS]
+    parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        choices=valid_task_names,
+        help="Run only this task instead of all tasks.",
+    )
+    return parser.parse_args()
+
+
+def _resolve_base_url(image_name: str) -> str:
+    """
+    Convert IMAGE_NAME into a base URL for the environment server.
+
+    Always connects via HTTP/WebSocket — never starts Docker.
+    The validator environment does not have Docker installed.
+    """
+    if not image_name:
+        return _DEFAULT_HF_SPACE
+
+    if image_name.startswith("http://") or image_name.startswith("https://"):
+        return image_name
+
+    # Bare hostnames like "localhost:7860" or HF Space slugs
+    if ":" in image_name or "." in image_name:
+        return f"https://{image_name}"
+
+    # Treat as an HF Space slug (org-space.hf.space)
+    return f"https://{image_name}.hf.space"
+
+
 async def main() -> None:
     """
-    Connect to the GpuScheduler environment container and run all three tasks.
+    Connect to the GpuScheduler environment and run tasks.
 
-    Tasks run sequentially on the same container instance.  The environment
-    server resets its internal state on each env.reset() call, so there is
-    no cross-contamination between episodes.
-
-    Total expected runtime: < 15 minutes on a 2-vCPU / 8 GB machine
-    (24 + 36 + 42 = 102 LLM calls × ~5 s each ≈ 8.5 minutes + env overhead).
+    Always connects to the HF Space (or other HTTP URL) via WebSocket.
+    Never attempts to start Docker — the validator environment does not
+    have Docker installed.
     """
+    args = _parse_args()
+
     log_path = _setup_inference_log_file()
     if log_path is not None:
         print(f"[LOG] Full run output also written to: {log_path}", flush=True)
@@ -1139,29 +1174,36 @@ async def main() -> None:
     try:
         client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-        # If IMAGE_NAME looks like a URL, connect directly; otherwise use Docker
-        if IMAGE_NAME and IMAGE_NAME.startswith("http"):
-            env = GpuSchedulerEnv(base_url=IMAGE_NAME)
+        base_url = _resolve_base_url(IMAGE_NAME)
+        print(f"[INFO] Connecting to environment at: {base_url}", flush=True)
+        env = GpuSchedulerEnv(base_url=base_url)
+
+        # Select tasks to run
+        if args.task:
+            tasks_to_run = [t for t in TASKS if t[0] == args.task]
         else:
-            env = await GpuSchedulerEnv.from_docker_image(IMAGE_NAME)
+            tasks_to_run = list(TASKS)
 
         try:
             results: Dict[str, bool] = {}
 
-            for task_name, max_steps, threshold in TASKS:
-                passed = await run_task(
-                    client=client,
-                    env=env,
-                    task_name=task_name,
-                    max_steps=max_steps,
-                    success_threshold=threshold,
-                )
-                results[task_name] = passed
-                # Blank line between task blocks for readability
+            for task_name, max_steps, threshold in tasks_to_run:
+                try:
+                    passed = await run_task(
+                        client=client,
+                        env=env,
+                        task_name=task_name,
+                        max_steps=max_steps,
+                        success_threshold=threshold,
+                    )
+                    results[task_name] = passed
+                except Exception as exc:
+                    print(f"[DEBUG] Task '{task_name}' failed: {exc}", flush=True)
+                    results[task_name] = False
                 print("", flush=True)
 
-            # Final summary (informational — not part of the mandatory format)
-            all_passed = all(results.values())
+            # Final summary
+            all_passed = all(results.values()) if results else False
             summary = " | ".join(
                 f"{t}={'PASS' if v else 'FAIL'}" for t, v in results.items()
             )
@@ -1171,14 +1213,16 @@ async def main() -> None:
             )
 
         finally:
-            # Always clean up the Docker container, even on exception
             try:
                 await env.close()
             except Exception as e:
                 print(
-                    f"[DEBUG] env.close() error (container cleanup): {e}",
+                    f"[DEBUG] env.close() error: {e}",
                     flush=True,
                 )
+    except Exception as exc:
+        print(f"[ERROR] Fatal: {exc}", flush=True)
+        sys.exit(1)
     finally:
         _teardown_inference_log_file()
 
