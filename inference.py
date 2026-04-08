@@ -105,6 +105,30 @@ def _get_model_name() -> str:
 def _get_image_name() -> str:
     return os.environ.get("IMAGE_NAME", _DEFAULT_HF_SPACE)
 
+
+def _using_validator_proxy() -> bool:
+    return "API_BASE_URL" in os.environ and "API_KEY" in os.environ
+
+
+def _make_openai_client() -> OpenAI:
+    """
+    Build the OpenAI client.
+
+    In the hackathon validator, API_BASE_URL and API_KEY are injected and must be
+    used exactly. For local development, we allow fallback to HF_TOKEN and the
+    default router URL.
+    """
+    if _using_validator_proxy():
+        return OpenAI(
+            base_url=os.environ["API_BASE_URL"],
+            api_key=os.environ["API_KEY"],
+        )
+
+    return OpenAI(
+        base_url=_get_api_base_url(),
+        api_key=_get_api_key(),
+    )
+
 # Mirror stdout to a log file (see module docstring)
 _INFERENCE_LOG_FP: Optional[TextIO] = None
 _ORIG_STDOUT: Optional[TextIO] = None
@@ -1188,13 +1212,20 @@ async def main() -> None:
         print(f"[LOG] Full run output also written to: {log_path}", flush=True)
 
     try:
-        api_base = _get_api_base_url()
-        api_key = _get_api_key()
+        api_base = os.environ["API_BASE_URL"] if "API_BASE_URL" in os.environ else _get_api_base_url()
+        api_key = os.environ["API_KEY"] if "API_KEY" in os.environ else _get_api_key()
         model = _get_model_name()
+        if not api_key:
+            raise RuntimeError(
+                "Missing API key for LLM calls. Expected API_KEY from validator "
+                "or HF_TOKEN for local runs."
+            )
+        if _using_validator_proxy():
+            print("[INFO] Using validator-provided LiteLLM proxy credentials", flush=True)
         print(f"[INFO] LLM endpoint: {api_base}", flush=True)
         print(f"[INFO] LLM model: {model}", flush=True)
         print(f"[INFO] API_KEY set: {bool(api_key)}", flush=True)
-        client = OpenAI(base_url=api_base, api_key=api_key)
+        client = _make_openai_client()
 
         base_url = _resolve_base_url(_get_image_name())
         print(f"[INFO] Connecting to environment at: {base_url}", flush=True)

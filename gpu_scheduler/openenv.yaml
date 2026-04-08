@@ -196,9 +196,12 @@ env_vars:
     description: "The model identifier to use for inference."
     default: "Qwen/Qwen2.5-72B-Instruct"
     required: false
+  API_KEY:
+    description: "LiteLLM proxy key injected by the validator for OpenAI-compatible calls."
+    required: false
   HF_TOKEN:
-    description: "HuggingFace / API key for LLM access."
-    required: true
+    description: "Fallback local-development API key when API_KEY is not provided."
+    required: false
 
 # ---------------------------------------------------------------------------
 # Infrastructure constraints
