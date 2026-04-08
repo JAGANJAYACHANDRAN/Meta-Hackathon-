@@ -24,7 +24,7 @@ STDOUT FORMAT (one block per task)
   [STEP]  step=<n> action=<str> reward=<0.00> done=<true|false> error=<msg|null>
           Optional indented "state" block on following lines (sim hour, nodes,
           running vs queued, GPUs per node).
-  [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...>
+  [END]   success=<true|false> steps=<n> score=<0.0001-0.9999> rewards=<r1,r2,...>
 
 TASK SCHEDULE
 --------------
@@ -919,6 +919,22 @@ def log_step(
         print(format_step_state_block(obs), flush=True)
 
 
+def _strict_unit_interval(value: float, epsilon: float = 1e-4) -> float:
+    """Clamp a value into the validator-required open interval (0, 1)."""
+    return max(epsilon, min(value, 1.0 - epsilon))
+
+
+def _format_strict_score(score: float) -> str:
+    """
+    Format terminal scores without rounding them back to 0 or 1.
+
+    The environment already tries to keep scores inside (0, 1), but printing with
+    only 3 decimals can turn 0.0001 into 0.000 or 0.9999 into 1.000, which the
+    validator rejects as out of range.
+    """
+    return f"{_strict_unit_interval(score):.4f}"
+
+
 def log_end(
     success: bool,
     steps: int,
@@ -929,7 +945,7 @@ def log_end(
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} "
-        f"score={score:.3f} rewards={rewards_str}",
+        f"score={_format_strict_score(score)} rewards={rewards_str}",
         flush=True,
     )
 
@@ -1133,7 +1149,7 @@ async def run_task(
         # Extract grader score
         raw_score = getattr(result.observation, "score", None)
         score = float(raw_score) if raw_score is not None else 0.0
-        score = max(0.0, min(score, 1.0))
+        score = _strict_unit_interval(score)
 
         success = score >= success_threshold
 
