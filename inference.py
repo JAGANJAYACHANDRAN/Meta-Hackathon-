@@ -64,12 +64,13 @@ from typing import Dict, List, Optional, TextIO, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Load .env file — check script directory first, then gpu_scheduler/
+# Load .env file as fallback — override=False ensures that env vars already
+# set by the validator (API_BASE_URL, API_KEY) are NOT overwritten by .env.
 _script_dir = Path(__file__).resolve().parent
 _env_path = _script_dir / ".env"
 if not _env_path.exists():
     _env_path = _script_dir / "gpu_scheduler" / ".env"
-load_dotenv(_env_path)
+load_dotenv(_env_path, override=False)
 
 # Import typed client + models from the gpu_scheduler package
 from gpu_scheduler import (
@@ -80,11 +81,11 @@ from gpu_scheduler import (
 )
 
 # ---------------------------------------------------------------------------
-# Environment variables — loaded from .env file or shell environment
+# Environment variables — validator-injected values take priority over .env
 # ---------------------------------------------------------------------------
 _DEFAULT_HF_SPACE = "https://PACMAN8055-gpu-scheduler-env.hf.space"
 IMAGE_NAME   = os.getenv("IMAGE_NAME", _DEFAULT_HF_SPACE)
-API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_KEY      = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 BENCHMARK    = "gpu_scheduler"
