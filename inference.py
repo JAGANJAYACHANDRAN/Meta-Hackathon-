@@ -110,7 +110,10 @@ def _make_openai_client() -> OpenAI:
     """
     base = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
     key = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or ""
-    print(f"[DEBUG] OpenAI client: base_url={base!r}, api_key={'set' if key else 'MISSING'}", flush=True)
+    print(f"[DEBUG] OpenAI client: base_url={base!r}", flush=True)
+    print(f"[DEBUG] OpenAI client: api_key={key[:8]}...{key[-4:]}" if len(key) > 12 else f"[DEBUG] api_key len={len(key)}", flush=True)
+    if not key:
+        raise RuntimeError("FATAL: No API_KEY or HF_TOKEN found in environment")
     return OpenAI(base_url=base, api_key=key)
 
 # Mirror stdout to a log file (see module docstring)
@@ -1215,23 +1218,38 @@ async def main() -> None:
         print(f"[LOG] Full run output also written to: {log_path}", flush=True)
 
     try:
+        # Dump all relevant env vars for debugging
+        print(f"[DEBUG] API_BASE_URL={os.environ.get('API_BASE_URL', '<NOT SET>')!r}", flush=True)
+        print(f"[DEBUG] API_KEY={'set(len=' + str(len(os.environ.get('API_KEY', ''))) + ')' if os.environ.get('API_KEY') else '<NOT SET>'}", flush=True)
+        print(f"[DEBUG] MODEL_NAME={os.environ.get('MODEL_NAME', '<NOT SET>')!r}", flush=True)
+        print(f"[DEBUG] HF_TOKEN={'set' if os.environ.get('HF_TOKEN') else '<NOT SET>'}", flush=True)
+        print(f"[DEBUG] IMAGE_NAME={os.environ.get('IMAGE_NAME', '<NOT SET>')!r}", flush=True)
+
         model = _get_model_name()
         client = _make_openai_client()
         api_base = os.environ.get("API_BASE_URL", "(default)")
         print(f"[INFO] LLM endpoint: {api_base}", flush=True)
         print(f"[INFO] LLM model: {model}", flush=True)
 
-        # Smoke-test: verify the LLM proxy is reachable with a tiny request
-        print("[INFO] Testing LLM proxy connectivity...", flush=True)
+        # Raw HTTP test: verify the proxy URL is reachable at the network level
+        import httpx
         try:
-            _test = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "Say OK"}],
-                max_tokens=3,
-            )
-            print(f"[INFO] LLM proxy test passed: {_test.choices[0].message.content!r}", flush=True)
-        except Exception as _e:
-            print(f"[WARN] LLM proxy test failed: {_e}", flush=True)
+            _probe_url = api_base.rstrip("/") + "/models"
+            print(f"[DEBUG] Raw HTTP probe: GET {_probe_url}", flush=True)
+            _resp = httpx.get(_probe_url, headers={"Authorization": f"Bearer {os.environ.get('API_KEY', '')}"}, timeout=15)
+            print(f"[DEBUG] Raw HTTP probe status: {_resp.status_code}", flush=True)
+        except Exception as _he:
+            print(f"[WARN] Raw HTTP probe failed: {_he}", flush=True)
+
+        # Smoke-test: verify the LLM proxy works with a real completion request.
+        # If this fails, we CRASH — continuing would produce zero API calls.
+        print("[INFO] Testing LLM proxy with a real API call...", flush=True)
+        _test = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Say OK"}],
+            max_tokens=3,
+        )
+        print(f"[INFO] LLM proxy test PASSED: {_test.choices[0].message.content!r}", flush=True)
 
         base_url = _resolve_base_url(_get_image_name())
         print(f"[INFO] Connecting to environment at: {base_url}", flush=True)
