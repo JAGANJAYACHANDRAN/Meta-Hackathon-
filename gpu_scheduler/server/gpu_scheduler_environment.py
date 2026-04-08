@@ -533,7 +533,7 @@ class GpuSchedulerEnvironment(Environment):
 
         raw_reward = reward_action + reward_time
         # Normalise to [0.0, 1.0]: 0.5 = neutral, >0.5 = good, <0.5 = bad
-        total_reward = max(0.0, min(1.0, REWARD_NEUTRAL + raw_reward))
+        total_reward = max(0.0001, min(0.9999, REWARD_NEUTRAL + raw_reward))
         self._cumulative_reward += total_reward
 
         # 3. Termination check
@@ -1105,7 +1105,13 @@ class GpuSchedulerEnvironment(Environment):
         else:
             score = completion_rate    # safe fallback for unknown tasks
 
-        return round(max(0.0, min(score, 1.0)), 4)
+        # Validator requires scores strictly in (0, 1) — not 0.0 or 1.0
+        clamped = max(0.0, min(score, 1.0))
+        if clamped <= 0.0:
+            clamped = 0.0001
+        if clamped >= 1.0:
+            clamped = 0.9999
+        return round(clamped, 4)
 
     # ------------------------------------------------------------------
     # Observation builder
