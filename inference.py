@@ -61,18 +61,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, TextIO, Tuple
 
-from dotenv import load_dotenv
 from openai import OpenAI
-
-# Load .env ONLY as a local-dev convenience — never in the validator.
-# The validator injects API_BASE_URL and API_KEY directly into os.environ.
-# override=False ensures injected vars are never overwritten.
-_script_dir = Path(__file__).resolve().parent
-_env_path = _script_dir / ".env"
-if not _env_path.exists():
-    _env_path = _script_dir / "gpu_scheduler" / ".env"
-if _env_path.exists():
-    load_dotenv(_env_path, override=False)
 
 # Import typed client + models from the gpu_scheduler package
 from gpu_scheduler import (
@@ -91,7 +80,11 @@ BENCHMARK    = "gpu_scheduler"
 
 
 def _get_api_key() -> str:
-    return os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or ""
+    # Validator injects API_KEY; fall back to HF_TOKEN for local dev only
+    key = os.environ.get("API_KEY", "")
+    if not key:
+        key = os.environ.get("HF_TOKEN", "")
+    return key
 
 
 def _get_api_base_url() -> str:
@@ -112,22 +105,13 @@ def _using_validator_proxy() -> bool:
 
 def _make_openai_client() -> OpenAI:
     """
-    Build the OpenAI client.
-
-    In the hackathon validator, API_BASE_URL and API_KEY are injected and must be
-    used exactly. For local development, we allow fallback to HF_TOKEN and the
-    default router URL.
+    Build the OpenAI client using API_BASE_URL and API_KEY from the environment.
+    The validator injects these directly — we always read from os.environ.
     """
-    if _using_validator_proxy():
-        return OpenAI(
-            base_url=os.environ["API_BASE_URL"],
-            api_key=os.environ["API_KEY"],
-        )
-
-    return OpenAI(
-        base_url=_get_api_base_url(),
-        api_key=_get_api_key(),
-    )
+    base = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+    key = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or ""
+    print(f"[DEBUG] OpenAI client: base_url={base!r}, api_key={'set' if key else 'MISSING'}", flush=True)
+    return OpenAI(base_url=base, api_key=key)
 
 # Mirror stdout to a log file (see module docstring)
 _INFERENCE_LOG_FP: Optional[TextIO] = None
@@ -739,7 +723,10 @@ def get_llm_actions(
         return actions, raw, proposed_strs
 
     except Exception as exc:
-        print(f"[DEBUG] LLM request failed at step {step}: {exc}", flush=True)
+        import traceback
+        print(f"[ERROR] LLM request failed at step {step}: {exc}", flush=True)
+        traceback.print_exc()
+        # Still return WAIT so the episode can continue, but the error is visible
         return [GpuSchedulerAction(action_type="WAIT")], "WAIT (api-error fallback)", []
 
 
@@ -1212,20 +1199,23 @@ async def main() -> None:
         print(f"[LOG] Full run output also written to: {log_path}", flush=True)
 
     try:
-        api_base = os.environ["API_BASE_URL"] if "API_BASE_URL" in os.environ else _get_api_base_url()
-        api_key = os.environ["API_KEY"] if "API_KEY" in os.environ else _get_api_key()
         model = _get_model_name()
-        if not api_key:
-            raise RuntimeError(
-                "Missing API key for LLM calls. Expected API_KEY from validator "
-                "or HF_TOKEN for local runs."
-            )
-        if _using_validator_proxy():
-            print("[INFO] Using validator-provided LiteLLM proxy credentials", flush=True)
+        client = _make_openai_client()
+        api_base = os.environ.get("API_BASE_URL", "(default)")
         print(f"[INFO] LLM endpoint: {api_base}", flush=True)
         print(f"[INFO] LLM model: {model}", flush=True)
-        print(f"[INFO] API_KEY set: {bool(api_key)}", flush=True)
-        client = _make_openai_client()
+
+        # Smoke-test: verify the LLM proxy is reachable with a tiny request
+        print("[INFO] Testing LLM proxy connectivity...", flush=True)
+        try:
+            _test = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "Say OK"}],
+                max_tokens=3,
+            )
+            print(f"[INFO] LLM proxy test passed: {_test.choices[0].message.content!r}", flush=True)
+        except Exception as _e:
+            print(f"[WARN] LLM proxy test failed: {_e}", flush=True)
 
         base_url = _resolve_base_url(_get_image_name())
         print(f"[INFO] Connecting to environment at: {base_url}", flush=True)
