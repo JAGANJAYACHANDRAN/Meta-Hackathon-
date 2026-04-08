@@ -35,6 +35,8 @@
 | `smooth_sailing`  | 24h         | 1.0        | 24          | 6h        | 42   | ~24 P1–P3 jobs with moderate GPU demand, some with deadlines.        |
 | `deadline_crunch` | 72h         | 2.0        | 36          | 12h       | 137  | ~30 P1–P3 jobs with bursty arrivals. P3 spot jobs can be sacrificed. |
 | `p0_emergency`    | 168h        | 4.0        | 42          | 24h       | 999  | ~40 mixed jobs + a 32-GPU P0 emergency arriving at hour 72.          |
+| `batch_priority_inversion` | 48h | 2.0    | 24          | 8h        | 777  | P3 background + bursty P1 arrivals testing atomic batch preemption.  |
+| `batch_gang_scheduling`    | 96h | 3.0    | 32          | 15h       | 2048 | Two P0 gang jobs (16-GPU + 24-GPU) requiring node capacity planning. |
 
 
 ---
@@ -66,6 +68,8 @@
 | `smooth_sailing`  | 24     | 2, 4, 8    | P1 (~~20%), P2 (~~60%), P3 (~20%) | ~35% of P1/P2 have deadlines | Fixed arrival hours with some bursts                                         |
 | `deadline_crunch` | 30     | 2, 4, 8    | P1 (~~37%), P2 (~~50%), P3 (~13%) | P1: 85%, P2: 65%, P3: none   | Random arrivals over 0–68h                                                   |
 | `p0_emergency`    | 40 + 1 | 1, 2, 4, 8 | P1, P2, P3                        | 50% have deadlines           | **Plus `job_P0_EMERGENCY`**: 32 GPUs, P0, arrives hour 72, deadline hour 132 |
+| `batch_priority_inversion` | 24 | 2, 4, 6, 8 | 8 P3 + 10 P1 + 6 P2          | P1: 100% tight (5-8h), P2: 50% | 8 P3 jobs hours 0-4, 10 P1 jobs hours 12-20, 6 P2 scattered                  |
+| `batch_gang_scheduling`    | 27 | 1-4 (bg), 16, 24 | 20 P2/P3 bg + 2 P0 gang + 5 P1 | P1: 100%, gang: 100%        | **Two gang jobs**: 16-GPU @ h24 (dl: h60), 24-GPU @ h60 (dl: h108)           |
 
 
 ---
@@ -391,9 +395,11 @@ Always sets `_last_action_result` so the LLM sees feedback.
 | `smooth_sailing`  | **80% completion + 20% utilisation**                 | Complete jobs efficiently                          |
 | `deadline_crunch` | **60% SLA compliance + 40% completion**              | Meet deadlines above all                           |
 | `p0_emergency`    | **50% P0 done (binary) + 30% SLA + 20% utilisation** | Handle the emergency, respect SLAs, stay efficient |
+| `batch_priority_inversion` | **70% SLA + 30% preemption efficiency**    | Meet P1 deadlines with strategic preemption        |
+| `batch_gang_scheduling`    | **40% gang completion + 30% SLA + 20% utilisation + 10% preemption efficiency** | Complete both gang jobs, maintain SLAs, efficient resource use |
 
 
-**Pass thresholds:** smooth_sailing ≥ 0.40, deadline_crunch ≥ 0.35, p0_emergency ≥ 0.30
+**Pass thresholds:** smooth_sailing ≥ 0.40, deadline_crunch ≥ 0.35, p0_emergency ≥ 0.30, batch_priority_inversion ≥ 0.50, batch_gang_scheduling ≥ 0.55
 
 ---
 

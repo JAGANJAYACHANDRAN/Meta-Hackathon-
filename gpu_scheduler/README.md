@@ -123,6 +123,16 @@ Moderate-demand window with ~24 P1–P3 jobs, some with deadlines. Keep GPUs occ
 One week of mixed load. At **hour 72**, a **32-GPU P0 gang job** arrives with a 60-hour deadline — requiring 4 fully-free nodes. The agent must drain nodes proactively; preempting costs 10× remaining value.
 **Grader:** `0.5 × p0_completed + 0.3 × sla_compliance + 0.2 × gpu_utilisation`
 
+### Hard — `batch_priority_inversion` (48h, 24 steps at 2h/step)
+A 48-hour scenario testing **atomic batch preemption**. Eight P3 background jobs occupy the cluster (hours 0-4), then 10 P1 jobs with tight deadlines arrive (hours 12-20). The agent must use BATCH actions to preempt multiple low-priority jobs and schedule high-priority work atomically, avoiding idle-GPU penalties between actions. Strategic preemption is key — thrashing destroys the score.
+**Grader:** `0.7 × sla_compliance + 0.3 × preemption_efficiency`
+**Pass threshold:** 0.50
+
+### Hard — `batch_gang_scheduling` (96h, 32 steps at 3h/step)
+A 96-hour multi-gang scheduling challenge. Two P0 gang jobs arrive at different times: a **16-GPU job at hour 24** (needs 2 fully-free nodes) and a **24-GPU job at hour 60** (needs 3 fully-free nodes). The agent must coordinate BATCH operations to preempt multiple jobs and free entire nodes while maintaining P1 SLAs and overall utilization. Requires multi-horizon planning: preparing for gang job #2 while gang job #1 is running.
+**Grader:** `0.4 × gang_completion + 0.3 × sla_compliance + 0.2 × utilisation + 0.1 × preemption_efficiency`
+**Pass threshold:** 0.55
+
 ---
 
 ## Real-World Tensions
@@ -214,6 +224,8 @@ The LLM agent outputs multiple actions per turn using a structured `REASON + ACT
 | `smooth_sailing` | ~0.60 | Greedy scheduling, good utilisation |
 | `deadline_crunch` | ~0.45 | Misses ~30% of deadlines |
 | `p0_emergency` | ~0.28 | Often fails to reserve space before hour 72 |
+| `batch_priority_inversion` | TBD | New test case for atomic batch preemption |
+| `batch_gang_scheduling` | TBD | New test case for multi-gang coordination |
 
 ---
 

@@ -63,8 +63,11 @@ from typing import Dict, List, Optional, TextIO, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Load .env file from the project root (same directory as this script)
-_env_path = Path(__file__).resolve().parent / ".env"
+# Load .env file — check script directory first, then gpu_scheduler/
+_script_dir = Path(__file__).resolve().parent
+_env_path = _script_dir / ".env"
+if not _env_path.exists():
+    _env_path = _script_dir / "gpu_scheduler" / ".env"
 load_dotenv(_env_path)
 
 # Import typed client + models from the gpu_scheduler package
@@ -126,7 +129,7 @@ def _setup_inference_log_file() -> Optional[Path]:
         if not log_path.is_absolute():
             log_path = Path.cwd() / log_path
     else:
-        log_dir = script_dir / "logs"
+        log_dir = script_dir / "gpu_scheduler" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"inference_{datetime.now():%Y%m%d_%H%M%S}.log"
 
@@ -158,6 +161,8 @@ TASKS: List[Tuple[str, int, float]] = [
     ("smooth_sailing",  24, 0.40),   # Easy:   24h sim,  1 h/step
     ("deadline_crunch", 36, 0.35),   # Medium: 72h sim,  2 h/step
     ("p0_emergency",    42, 0.30),   # Hard:  168h sim,  4 h/step
+    ("batch_priority_inversion", 24, 0.50),  # Hard:  48h sim,  2 h/step
+    ("batch_gang_scheduling", 32, 0.55),     # Hard:  96h sim,  3 h/step
 ]
 
 # LLM sampling config — lower temperature = more deterministic scheduling
@@ -424,10 +429,11 @@ def parse_single_action(line: str) -> Optional[GpuSchedulerAction]:
     # SCHEDULE job_id node_id  (job_id can be job_NNN or job_P0_EMERGENCY etc.)
     m = re.match(r"SCHEDULE\s+(job_\w+)\s+(\d+)", line, re.IGNORECASE)
     if m:
+        node_id = min(int(m.group(2)), 7)  # clamp to valid range 0-7
         return GpuSchedulerAction(
             action_type="SCHEDULE",
             job_id=m.group(1),
-            node_id=int(m.group(2)),
+            node_id=node_id,
         )
 
     # PREEMPT job_id
@@ -702,7 +708,7 @@ def get_llm_actions(
 _STEP_LABEL_W = 18  # width for right-aligned labels in the state block
 # Human-readable step trace (does not affect hackathon [STEP] line format)
 _STEP_LOG_SEPARATOR = "=" * 72
-_STEP_LOG_TRAIL_BLANK_LINES = 10
+_STEP_LOG_TRAIL_BLANK_LINES = 1
 
 
 def _print_env_step_trace(
@@ -713,20 +719,16 @@ def _print_env_step_trace(
     batch_action_strings: List[str],
     executed_action: str,
 ) -> None:
-    """LLM text + batch metadata, framed with === lines (stdout only)."""
-    print(_STEP_LOG_SEPARATOR, flush=True)
-    print(
-        f"LLM RAW RESPONSE (env step {env_step}, "
-        f"batch action {batch_index}/{batch_size}):",
-        flush=True,
-    )
-    print(llm_raw, flush=True)
-    print(_STEP_LOG_SEPARATOR, flush=True)
-    print("STEP DETAILS:", flush=True)
-    print(f"  actions_in_batch: {batch_size}", flush=True)
-    print(f"  full_batch: [{', '.join(batch_action_strings)}]", flush=True)
-    print(f"  executed_this_step: {executed_action}", flush=True)
-    print(_STEP_LOG_SEPARATOR, flush=True)
+    """Compact step trace: LLM reasoning + executed actions."""
+    reason = ""
+    for line in llm_raw.split("\n"):
+        if line.strip().upper().startswith("REASON"):
+            reason = line.strip().split(":", 1)[-1].strip()
+            break
+    print(f"    Why:  {reason}", flush=True)
+    print(f"    Did:  {executed_action}", flush=True)
+    if batch_size > 1:
+        print(f"    Batch: [{', '.join(batch_action_strings)}]", flush=True)
 
 
 def _step_state_line(label: str, value: str) -> str:
@@ -734,36 +736,133 @@ def _step_state_line(label: str, value: str) -> str:
     return f"      {label:>{_STEP_LABEL_W}} : {value}"
 
 
+def _fmt_deadline(deadline_hour: Optional[float], current_hour: float) -> str:
+    """Format deadline as human-readable time left."""
+    if deadline_hour is None:
+        return "     —     "
+    left = deadline_hour - current_hour
+    if left <= 0:
+        return "  OVERDUE! "
+    return f"  {left:>4.0f}h left"
+
+
 def format_step_state_block(obs: GpuSchedulerObservation) -> str:
     """
-    Multi-line cluster summary after env.step (human-readable; printed below [STEP]).
-
-    Right-aligned labels, spaced GPU columns, sim clock from observation.
+    Rich cluster dashboard printed below each [STEP] line.
+    Designed to be scannable at a glance by anyone.
     """
-    nodes_sorted = sorted(obs.nodes, key=lambda n: n.node_id)
-    occupied = sum(1 for n in nodes_sorted if n.used_gpus > 0)
-    gpu_parts = [
-        f"n{n.node_id} {n.used_gpus:>2}/{n.total_gpus}" for n in nodes_sorted
-    ]
-    # Align continuation with first line's value column (6 spaces + label + " : ")
-    value_indent = 6 + _STEP_LABEL_W + 3
-    cont = " " * value_indent
-    gpu_line1 = "   ".join(gpu_parts[:4])
-    gpu_line2 = "   ".join(gpu_parts[4:]) if len(gpu_parts) > 4 else ""
-    lines = [
-        _step_state_line(
-            "sim_hour",
-            f"{obs.current_hour:.0f} / {obs.total_hours:.0f}",
-        ),
-        _step_state_line("occupied_nodes", str(occupied)),
-        _step_state_line(
-            "jobs",
-            f"running {len(obs.active_jobs)}    queued {len(obs.queue)}",
-        ),
-        _step_state_line("GPUs per node", gpu_line1),
-    ]
-    if gpu_line2:
-        lines.append(f"{cont}{gpu_line2}")
+    W = 80  # dashboard width
+    total_gpus = sum(n.total_gpus for n in obs.nodes)
+    used_gpus = sum(n.used_gpus for n in obs.nodes)
+    util_pct = (used_gpus / total_gpus * 100) if total_gpus else 0
+    hours_left = obs.total_hours - obs.current_hour
+    pbar_filled = int(obs.current_hour / obs.total_hours * 20) if obs.total_hours else 0
+    pbar = "▓" * pbar_filled + "░" * (20 - pbar_filled)
+
+    lines = [""]
+    lines.append("  ╔" + "═" * W + "╗")
+    lines.append(f"  ║  TIME  [{pbar}]  Hour {obs.current_hour:.0f} / {obs.total_hours:.0f}  ({hours_left:.0f}h left)" + " " * max(0, W - 60) + "║".rjust(max(1, W - len(f"  TIME  [{pbar}]  Hour {obs.current_hour:.0f} / {obs.total_hours:.0f}  ({hours_left:.0f}h left)") + 1)))
+
+    # Simpler header
+    lines = [""]
+    lines.append("  ╔" + "═" * W + "╗")
+
+    time_str = f"Hour {obs.current_hour:.0f}/{obs.total_hours:.0f} ({hours_left:.0f}h left)"
+    gpu_str = f"GPUs {used_gpus}/{total_gpus} ({util_pct:.0f}%)"
+    burn_str = f"Burn ${obs.compute_burn_so_far:,.0f}"
+    header = f"  ║  {time_str}   |   {gpu_str}   |   {burn_str}"
+    lines.append(header + " " * (W - len(header) + 3) + "║")
+    lines.append("  ╠" + "═" * W + "╣")
+
+    # --- NODES ---
+    lines.append("  ║" + " " * W + "║")
+    lines.append("  ║  NODES" + " " * (W - 7) + "║")
+    for n in sorted(obs.nodes, key=lambda x: x.node_id):
+        bar = "█" * n.used_gpus + "░" * n.free_gpus
+        jobs = ", ".join(n.running_jobs) if n.running_jobs else "—"
+        warn = " ⚠" if n.memory_contention >= 0.75 else ""
+        row = f"  ║   N{n.node_id} [{bar}] {n.used_gpus:>1}/{n.total_gpus} GPUs   {jobs}{warn}"
+        lines.append(row + " " * (W - len(row) + 3) + "║")
+
+    # --- RUNNING JOBS ---
+    lines.append("  ║" + " " * W + "║")
+    lines.append("  ╟" + "─" * W + "╢")
+    lines.append("  ║" + " " * W + "║")
+    run_hdr = f"  ║  RUNNING ({len(obs.active_jobs)})"
+    lines.append(run_hdr + " " * (W - len(run_hdr) + 3) + "║")
+
+    if obs.active_jobs:
+        col = "  ║   {:<16s} {:>4s} {:>6s} {:>10s} {:>8s} {:>12s}"
+        hdr = col.format("JOB", "PRI", "GPUs", "PROGRESS", "ON NODE", "DEADLINE")
+        lines.append(hdr + " " * (W - len(hdr) + 3) + "║")
+        sep = "  ║   " + "─" * 60
+        lines.append(sep + " " * (W - len(sep) + 3) + "║")
+
+        for j in sorted(obs.active_jobs, key=lambda x: x.priority):
+            dl = _fmt_deadline(j.deadline_hour, obs.current_hour)
+            at_risk = " ⚠" if j.deadline_hour and (j.deadline_hour - obs.current_hour) < (j.duration_hours * (1 - j.progress)) else ""
+            nodes_str = ",".join(str(n) for n in j.assigned_nodes)
+            row = f"  ║   {j.job_id:<16s} [{j.priority_label}]  {j.gpu_count:>3d}    {j.progress:>7.1%}   [{nodes_str:>5s}]  {dl}{at_risk}"
+            lines.append(row + " " * (W - len(row) + 3) + "║")
+    else:
+        row = "  ║   (none)"
+        lines.append(row + " " * (W - len(row) + 3) + "║")
+
+    # --- QUEUED JOBS ---
+    lines.append("  ║" + " " * W + "║")
+    lines.append("  ╟" + "─" * W + "╢")
+    lines.append("  ║" + " " * W + "║")
+    q_hdr = f"  ║  WAITING IN QUEUE ({len(obs.queue)})"
+    lines.append(q_hdr + " " * (W - len(q_hdr) + 3) + "║")
+
+    if obs.queue:
+        col = "  ║   {:<16s} {:>4s} {:>6s} {:>10s} {:>10s} {:>12s}"
+        hdr = col.format("JOB", "PRI", "GPUs", "NEEDS", "WAITED", "DEADLINE")
+        lines.append(hdr + " " * (W - len(hdr) + 3) + "║")
+        sep = "  ║   " + "─" * 60
+        lines.append(sep + " " * (W - len(sep) + 3) + "║")
+
+        for j in sorted(obs.queue, key=lambda x: x.priority)[:8]:
+            dl = _fmt_deadline(j.deadline_hour, obs.current_hour)
+            row = f"  ║   {j.job_id:<16s} [{j.priority_label}]  {j.gpu_count:>3d}    {j.duration_hours:>6.0f}h   {j.hours_in_queue:>6.0f}h   {dl}"
+            lines.append(row + " " * (W - len(row) + 3) + "║")
+        if len(obs.queue) > 8:
+            more = f"  ║   + {len(obs.queue) - 8} more..."
+            lines.append(more + " " * (W - len(more) + 3) + "║")
+    else:
+        row = "  ║   (empty — nothing to schedule)"
+        lines.append(row + " " * (W - len(row) + 3) + "║")
+
+    # --- ARRIVING SOON ---
+    if obs.upcoming_jobs:
+        lines.append("  ║" + " " * W + "║")
+        lines.append("  ╟" + "─" * W + "╢")
+        lines.append("  ║" + " " * W + "║")
+        u_hdr = f"  ║  ARRIVING SOON ({len(obs.upcoming_jobs)})"
+        lines.append(u_hdr + " " * (W - len(u_hdr) + 3) + "║")
+
+        col = "  ║   {:<16s} {:>4s} {:>6s} {:>10s} {:>12s}"
+        hdr = col.format("JOB", "PRI", "GPUs", "ARRIVES IN", "DEADLINE")
+        lines.append(hdr + " " * (W - len(hdr) + 3) + "║")
+        sep = "  ║   " + "─" * 55
+        lines.append(sep + " " * (W - len(sep) + 3) + "║")
+
+        for j in obs.upcoming_jobs[:4]:
+            arrives_in = j.arrival_hour - obs.current_hour
+            dl = _fmt_deadline(j.deadline_hour, obs.current_hour)
+            row = f"  ║   {j.job_id:<16s} [{j.priority_label}]  {j.gpu_count:>3d}    {arrives_in:>6.0f}h     {dl}"
+            lines.append(row + " " * (W - len(row) + 3) + "║")
+        if len(obs.upcoming_jobs) > 4:
+            more = f"  ║   + {len(obs.upcoming_jobs) - 4} more..."
+            lines.append(more + " " * (W - len(more) + 3) + "║")
+
+    # --- LAST ACTION ---
+    lines.append("  ║" + " " * W + "║")
+    lines.append("  ╟" + "─" * W + "╢")
+    act = f"  ║  Result: {obs.last_action_result}"
+    lines.append(act + " " * max(0, W - len(act) + 3) + "║")
+    lines.append("  ╚" + "═" * W + "╝")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -982,8 +1081,7 @@ async def run_task(
                 error=error,
                 obs=obs,
             )
-            print(_STEP_LOG_SEPARATOR, flush=True)
-            print("\n" * _STEP_LOG_TRAIL_BLANK_LINES, end="", flush=True)
+            print("", flush=True)
 
             # Track preemptions in this step for cooldown
             for a in parsed_actions:
