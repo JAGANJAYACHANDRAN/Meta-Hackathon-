@@ -1048,7 +1048,7 @@ def _build_batch_action(
 
 async def run_task(
     client: OpenAI,
-    env: GpuSchedulerEnv,
+    base_url: str,
     task_name: str,
     max_steps: int,
     success_threshold: float,
@@ -1077,6 +1077,7 @@ async def run_task(
     preempt_history: Dict[str, int] = {}
     PREEMPT_COOLDOWN = 5  # blocks re-preemption for 5 steps
 
+    env = GpuSchedulerEnv(base_url=base_url)
     log_start(task=task_name, env_name=BENCHMARK, model=_get_model_name())
 
     try:
@@ -1196,7 +1197,12 @@ async def run_task(
         _log_debug(f"[DEBUG] Task '{task_name}' crashed: {exc}")
 
     finally:
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+        try:
+            await env.close()
+        except Exception as e:
+            _log_debug(f"[DEBUG] env.close() error for '{task_name}': {e}")
+        finally:
+            log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
     return success
 
@@ -1267,16 +1273,6 @@ async def main() -> None:
         _log_debug(f"[INFO] LLM endpoint: {api_base}")
         _log_debug(f"[INFO] LLM model: {model}")
 
-        # Raw HTTP test: verify the proxy URL is reachable at the network level
-        import httpx
-        try:
-            _probe_url = api_base.rstrip("/") + "/models"
-            _log_debug(f"[DEBUG] Raw HTTP probe: GET {_probe_url}")
-            _resp = httpx.get(_probe_url, headers={"Authorization": f"Bearer {os.environ.get('API_KEY', '')}"}, timeout=15)
-            _log_debug(f"[DEBUG] Raw HTTP probe status: {_resp.status_code}")
-        except Exception as _he:
-            _log_debug(f"[WARN] Raw HTTP probe failed: {_he}")
-
         # Smoke-test: verify the LLM proxy works with a real completion request.
         # If this fails, we CRASH — continuing would produce zero API calls.
         _log_debug("[INFO] Testing LLM proxy with a real API call...")
@@ -1289,7 +1285,6 @@ async def main() -> None:
 
         base_url = _resolve_base_url(_get_image_name())
         _log_debug(f"[INFO] Connecting to environment at: {base_url}")
-        env = GpuSchedulerEnv(base_url=base_url)
 
         # Select tasks to run
         if args.task:
@@ -1297,37 +1292,31 @@ async def main() -> None:
         else:
             tasks_to_run = list(TASKS)
 
-        try:
-            results: Dict[str, bool] = {}
+        results: Dict[str, bool] = {}
 
-            for task_name, max_steps, threshold in tasks_to_run:
-                try:
-                    passed = await run_task(
-                        client=client,
-                        env=env,
-                        task_name=task_name,
-                        max_steps=max_steps,
-                        success_threshold=threshold,
-                    )
-                    results[task_name] = passed
-                except Exception as exc:
-                    _log_debug(f"[DEBUG] Task '{task_name}' failed: {exc}")
-                    results[task_name] = False
-
-            # Final summary
-            all_passed = all(results.values()) if results else False
-            summary = " | ".join(
-                f"{t}={'PASS' if v else 'FAIL'}" for t, v in results.items()
-            )
-            _log_debug(
-                f"[INFO] Summary: {summary} | all_passed={str(all_passed).lower()}"
-            )
-
-        finally:
+        for task_name, max_steps, threshold in tasks_to_run:
             try:
-                await env.close()
-            except Exception as e:
-                _log_debug(f"[DEBUG] env.close() error: {e}")
+                passed = await run_task(
+                    client=client,
+                    base_url=base_url,
+                    task_name=task_name,
+                    max_steps=max_steps,
+                    success_threshold=threshold,
+                )
+                results[task_name] = passed
+            except Exception as exc:
+                _log_debug(f"[DEBUG] Task '{task_name}' failed: {exc}")
+                results[task_name] = False
+
+        # Final summary
+        all_passed = all(results.values()) if results else False
+        summary = " | ".join(
+            f"{t}={'PASS' if v else 'FAIL'}" for t, v in results.items()
+        )
+        _log_debug(
+            f"[INFO] Summary: {summary} | all_passed={str(all_passed).lower()}"
+        )
+
     except Exception as exc:
         _log_debug(f"[ERROR] Fatal: {exc}")
         sys.exit(1)

@@ -113,6 +113,11 @@ class TestOpenAIClientUsage:
         assert "import google.generativeai" not in source
         assert "import cohere" not in source
 
+    def test_no_direct_http_llm_calls(self):
+        source = open(os.path.join(ROOT, "inference.py")).read()
+        assert "httpx.get(" not in source
+        assert "requests.get(" not in source
+
 
 class TestOpenEnvYaml:
     """Validate openenv.yaml structure and content."""
