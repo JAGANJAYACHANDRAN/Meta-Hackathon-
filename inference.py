@@ -43,10 +43,13 @@ RUN
 
 OPTIONAL LOG FILE (full stdout mirror for inspection)
 ------------------------------------------------------
-  INFERENCE_LOG_FILE   — path to write every printed line (still prints to
-                         terminal). Set to off / false / 0 to disable.
+  INFERENCE_LOG_FILE   — path to write diagnostic stderr output. By default,
+                         terminal output stays strict and diagnostics go to a
+                         log file. Set to off / false / 0 to disable.
                          If unset, defaults to:
                          gpu_scheduler/logs/inference_YYYYMMDD_HHMMSS.log
+  INFERENCE_VERBOSE    — set to 1 / true / yes to also mirror diagnostics to
+                         the terminal for local debugging.
 """
 
 import argparse
@@ -126,37 +129,52 @@ def _make_openai_client() -> OpenAI:
 # stdout is reserved for the evaluator's [START]/[STEP]/[END] lines only.
 _INFERENCE_LOG_FP: Optional[TextIO] = None
 _ORIG_STDERR: Optional[TextIO] = None
+_INFERENCE_VERBOSE = False
 
 
-class _TeeStream:
-    """Write to the real terminal stream and to an open log file."""
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a conventional boolean environment variable."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
-    def __init__(self, terminal: TextIO, log_file: TextIO) -> None:
+
+class _DiagnosticStream:
+    """Write diagnostics to a log file and optionally mirror to terminal."""
+
+    def __init__(self, log_file: TextIO, terminal: Optional[TextIO] = None) -> None:
         self._terminal = terminal
         self._log_file = log_file
 
     def write(self, s: str) -> int:
-        self._terminal.write(s)
+        if self._terminal is not None:
+            self._terminal.write(s)
+            self._terminal.flush()
         self._log_file.write(s)
-        self._terminal.flush()
         self._log_file.flush()
         return len(s)
 
     def flush(self) -> None:
-        self._terminal.flush()
+        if self._terminal is not None:
+            self._terminal.flush()
         self._log_file.flush()
 
     def __getattr__(self, name: str):
-        return getattr(self._terminal, name)
+        return getattr(self._terminal or self._log_file, name)
 
 
 def _setup_inference_log_file() -> Optional[Path]:
     """
-    Tee stderr to a log file so diagnostic output is preserved.
-    stdout is left untouched — only [START]/[STEP]/[END] go there.
+    Route diagnostic stderr output to a log file.
+
+    By default, the user's terminal stays quiet so the visible console output
+    matches the hackathon's `[START]` / `[STEP]` / `[END]` examples. Setting
+    `INFERENCE_VERBOSE=1` mirrors the same diagnostics back to the terminal.
     Returns the path written, or None if disabled.
     """
-    global _INFERENCE_LOG_FP, _ORIG_STDERR
+    global _INFERENCE_LOG_FP, _ORIG_STDERR, _INFERENCE_VERBOSE
+    _INFERENCE_VERBOSE = _env_flag("INFERENCE_VERBOSE", default=False)
     raw = os.getenv("INFERENCE_LOG_FILE", "").strip().lower()
     if raw in ("0", "false", "no", "off", "disable", "disabled"):
         return None
@@ -174,18 +192,22 @@ def _setup_inference_log_file() -> Optional[Path]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     _INFERENCE_LOG_FP = open(log_path, "w", encoding="utf-8")
     _ORIG_STDERR = sys.stderr
-    sys.stderr = _TeeStream(_ORIG_STDERR, _INFERENCE_LOG_FP)
+    sys.stderr = _DiagnosticStream(
+        log_file=_INFERENCE_LOG_FP,
+        terminal=_ORIG_STDERR if _INFERENCE_VERBOSE else None,
+    )
     return log_path
 
 
 def _teardown_inference_log_file() -> None:
-    global _INFERENCE_LOG_FP, _ORIG_STDERR
+    global _INFERENCE_LOG_FP, _ORIG_STDERR, _INFERENCE_VERBOSE
     if _ORIG_STDERR is not None:
         sys.stderr = _ORIG_STDERR
         _ORIG_STDERR = None
     if _INFERENCE_LOG_FP is not None:
         _INFERENCE_LOG_FP.close()
         _INFERENCE_LOG_FP = None
+    _INFERENCE_VERBOSE = False
 
 # ---------------------------------------------------------------------------
 # Task configuration
@@ -1241,7 +1263,7 @@ async def main() -> None:
 
         model = _get_model_name()
         client = _make_openai_client()
-        api_base = os.environ.get("API_BASE_URL", "(default)")
+        api_base = _get_api_base_url()
         _log_debug(f"[INFO] LLM endpoint: {api_base}")
         _log_debug(f"[INFO] LLM model: {model}")
 

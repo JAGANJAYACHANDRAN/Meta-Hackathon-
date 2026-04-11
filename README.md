@@ -199,7 +199,14 @@ python inference.py
 # Run a specific task only
 python inference.py --task smooth_sailing
 python inference.py --task p0_emergency
+
+# Optional: show local debug/dashboard output as well
+INFERENCE_VERBOSE=1 python inference.py
 ```
+
+By default, terminal output is kept strict so you only see the hackathon
+`[START]`, `[STEP]`, and `[END]` records. Extra diagnostics are written to
+`gpu_scheduler/logs/` unless you disable logging.
 
 ### Run with Local LLM (Ollama)
 

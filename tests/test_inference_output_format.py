@@ -254,3 +254,51 @@ class TestNoStdoutNoise:
             sys.stderr = old_err
         assert stdout_buf.getvalue() == "", "Debug output must not appear on stdout"
         assert "[DEBUG] test message" in stderr_buf.getvalue()
+
+
+class TestDiagnosticConsoleBehavior:
+    """Verify default terminal output stays strict unless verbose is enabled."""
+
+    def test_default_log_setup_hides_stderr_from_terminal(self, monkeypatch, tmp_path):
+        import io
+        import inference
+
+        log_path = tmp_path / "inference.log"
+        terminal_buf = io.StringIO()
+        old_stderr = sys.stderr
+
+        monkeypatch.setenv("INFERENCE_LOG_FILE", str(log_path))
+        monkeypatch.delenv("INFERENCE_VERBOSE", raising=False)
+        sys.stderr = terminal_buf
+
+        try:
+            inference._setup_inference_log_file()
+            inference._log_debug("[DEBUG] hidden from terminal")
+        finally:
+            inference._teardown_inference_log_file()
+            sys.stderr = old_stderr
+
+        assert terminal_buf.getvalue() == ""
+        assert "[DEBUG] hidden from terminal" in log_path.read_text()
+
+    def test_verbose_log_setup_mirrors_stderr_to_terminal(self, monkeypatch, tmp_path):
+        import io
+        import inference
+
+        log_path = tmp_path / "inference.log"
+        terminal_buf = io.StringIO()
+        old_stderr = sys.stderr
+
+        monkeypatch.setenv("INFERENCE_LOG_FILE", str(log_path))
+        monkeypatch.setenv("INFERENCE_VERBOSE", "1")
+        sys.stderr = terminal_buf
+
+        try:
+            inference._setup_inference_log_file()
+            inference._log_debug("[DEBUG] mirrored to terminal")
+        finally:
+            inference._teardown_inference_log_file()
+            sys.stderr = old_stderr
+
+        assert "[DEBUG] mirrored to terminal" in terminal_buf.getvalue()
+        assert "[DEBUG] mirrored to terminal" in log_path.read_text()
