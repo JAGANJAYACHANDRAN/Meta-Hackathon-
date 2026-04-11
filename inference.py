@@ -11,20 +11,18 @@ GPUScheduler-Env Inference Script
 Runs an LLM-driven scheduling agent against all three environment tasks
 and emits structured stdout logs required by the hackathon evaluator.
 
-MANDATORY ENVIRONMENT VARIABLES
---------------------------------
-  HF_TOKEN      — HuggingFace / API key for LLM access
-  IMAGE_NAME    — Docker image tag for the GpuScheduler environment server
-  API_BASE_URL  — LLM API endpoint  (default: HuggingFace inference router)
+ENVIRONMENT VARIABLES
+---------------------
+  HF_TOKEN      — HuggingFace API token (REQUIRED, no default)
+  API_BASE_URL  — LLM API endpoint  (default: https://router.huggingface.co/v1)
   MODEL_NAME    — Model identifier  (default: Qwen/Qwen2.5-72B-Instruct)
+  IMAGE_NAME    — Docker image tag or HF Space URL for the environment server
 
 STDOUT FORMAT (one block per task)
 ------------------------------------
   [START] task=<name> env=gpu_scheduler model=<model>
   [STEP]  step=<n> action=<str> reward=<0.00> done=<true|false> error=<msg|null>
-          Optional indented "state" block on following lines (sim hour, nodes,
-          running vs queued, GPUs per node).
-  [END]   success=<true|false> steps=<n> score=<0.0001-0.9999> rewards=<r1,r2,...>
+  [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
 
 TASK SCHEDULE
 --------------
@@ -63,6 +61,13 @@ from typing import Dict, List, Optional, TextIO, Tuple
 
 from openai import OpenAI
 
+
+def _log_debug(msg: str) -> None:
+    """Print diagnostic/debug output to stderr so it never pollutes the
+    evaluator's stdout stream (which must contain ONLY [START]/[STEP]/[END])."""
+    print(msg, file=sys.stderr, flush=True)
+
+
 # Import typed client + models from the gpu_scheduler package
 from gpu_scheduler import (
     GpuSchedulerAction,
@@ -80,10 +85,11 @@ BENCHMARK    = "gpu_scheduler"
 
 
 def _get_api_key() -> str:
-    # Validator injects API_KEY; fall back to HF_TOKEN for local dev only
-    key = os.environ.get("API_KEY", "")
+    """Return the API key.  HF_TOKEN is the spec-mandated variable;
+    API_KEY is an optional validator override."""
+    key = os.environ.get("HF_TOKEN", "")
     if not key:
-        key = os.environ.get("HF_TOKEN", "")
+        key = os.environ.get("API_KEY", "")
     return key
 
 
@@ -100,29 +106,30 @@ def _get_image_name() -> str:
 
 
 def _using_validator_proxy() -> bool:
-    return "API_BASE_URL" in os.environ and "API_KEY" in os.environ
+    return "API_BASE_URL" in os.environ and ("HF_TOKEN" in os.environ or "API_KEY" in os.environ)
 
 
 def _make_openai_client() -> OpenAI:
     """
-    Build the OpenAI client using API_BASE_URL and API_KEY from the environment.
-    The validator injects these directly — we always read from os.environ.
+    Build the OpenAI client using API_BASE_URL and HF_TOKEN from the environment.
+    HF_TOKEN is the spec-mandated key; API_KEY is accepted as a validator override.
     """
-    base = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-    key = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or ""
-    print(f"[DEBUG] OpenAI client: base_url={base!r}", flush=True)
-    print(f"[DEBUG] OpenAI client: api_key={key[:8]}...{key[-4:]}" if len(key) > 12 else f"[DEBUG] api_key len={len(key)}", flush=True)
+    base = _get_api_base_url()
+    key = _get_api_key()
+    _log_debug(f"[DEBUG] OpenAI client: base_url={base!r}")
+    _log_debug(f"[DEBUG] OpenAI client: api_key={key[:8]}...{key[-4:]}" if len(key) > 12 else f"[DEBUG] api_key len={len(key)}")
     if not key:
-        raise RuntimeError("FATAL: No API_KEY or HF_TOKEN found in environment")
+        raise ValueError("HF_TOKEN environment variable is required")
     return OpenAI(base_url=base, api_key=key)
 
-# Mirror stdout to a log file (see module docstring)
+# Mirror stderr (diagnostic output) to a log file.
+# stdout is reserved for the evaluator's [START]/[STEP]/[END] lines only.
 _INFERENCE_LOG_FP: Optional[TextIO] = None
-_ORIG_STDOUT: Optional[TextIO] = None
+_ORIG_STDERR: Optional[TextIO] = None
 
 
-class _TeeStdout:
-    """Write to the real terminal and to an open log file."""
+class _TeeStream:
+    """Write to the real terminal stream and to an open log file."""
 
     def __init__(self, terminal: TextIO, log_file: TextIO) -> None:
         self._terminal = terminal
@@ -145,9 +152,11 @@ class _TeeStdout:
 
 def _setup_inference_log_file() -> Optional[Path]:
     """
-    Tee stdout to a log file. Returns the path written, or None if disabled.
+    Tee stderr to a log file so diagnostic output is preserved.
+    stdout is left untouched — only [START]/[STEP]/[END] go there.
+    Returns the path written, or None if disabled.
     """
-    global _INFERENCE_LOG_FP, _ORIG_STDOUT
+    global _INFERENCE_LOG_FP, _ORIG_STDERR
     raw = os.getenv("INFERENCE_LOG_FILE", "").strip().lower()
     if raw in ("0", "false", "no", "off", "disable", "disabled"):
         return None
@@ -164,16 +173,16 @@ def _setup_inference_log_file() -> Optional[Path]:
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     _INFERENCE_LOG_FP = open(log_path, "w", encoding="utf-8")
-    _ORIG_STDOUT = sys.stdout
-    sys.stdout = _TeeStdout(_ORIG_STDOUT, _INFERENCE_LOG_FP)
+    _ORIG_STDERR = sys.stderr
+    sys.stderr = _TeeStream(_ORIG_STDERR, _INFERENCE_LOG_FP)
     return log_path
 
 
 def _teardown_inference_log_file() -> None:
-    global _INFERENCE_LOG_FP, _ORIG_STDOUT
-    if _ORIG_STDOUT is not None:
-        sys.stdout = _ORIG_STDOUT
-        _ORIG_STDOUT = None
+    global _INFERENCE_LOG_FP, _ORIG_STDERR
+    if _ORIG_STDERR is not None:
+        sys.stderr = _ORIG_STDERR
+        _ORIG_STDERR = None
     if _INFERENCE_LOG_FP is not None:
         _INFERENCE_LOG_FP.close()
         _INFERENCE_LOG_FP = None
@@ -727,8 +736,8 @@ def get_llm_actions(
 
     except Exception as exc:
         import traceback
-        print(f"[ERROR] LLM request failed at step {step}: {exc}", flush=True)
-        traceback.print_exc()
+        _log_debug(f"[ERROR] LLM request failed at step {step}: {exc}")
+        traceback.print_exc(file=sys.stderr)
         # Still return WAIT so the episode can continue, but the error is visible
         return [GpuSchedulerAction(action_type="WAIT")], "WAIT (api-error fallback)", []
 
@@ -757,10 +766,10 @@ def _print_env_step_trace(
         if line.strip().upper().startswith("REASON"):
             reason = line.strip().split(":", 1)[-1].strip()
             break
-    print(f"    Why:  {reason}", flush=True)
-    print(f"    Did:  {executed_action}", flush=True)
+    _log_debug(f"    Why:  {reason}")
+    _log_debug(f"    Did:  {executed_action}")
     if batch_size > 1:
-        print(f"    Batch: [{', '.join(batch_action_strings)}]", flush=True)
+        _log_debug(f"    Batch: [{', '.join(batch_action_strings)}]")
 
 
 def _step_state_line(label: str, value: str) -> str:
@@ -919,23 +928,13 @@ def log_step(
         flush=True,
     )
     if obs is not None:
-        print(format_step_state_block(obs), flush=True)
+        _log_debug(format_step_state_block(obs))
 
 
 def _strict_unit_interval(value: float, epsilon: float = 1e-4) -> float:
     """Clamp a value into the validator-required open interval (0, 1)."""
     return max(epsilon, min(value, 1.0 - epsilon))
 
-
-def _format_strict_score(score: float) -> str:
-    """
-    Format terminal scores without rounding them back to 0 or 1.
-
-    The environment already tries to keep scores inside (0, 1), but printing with
-    only 3 decimals can turn 0.0001 into 0.000 or 0.9999 into 1.000, which the
-    validator rejects as out of range.
-    """
-    return f"{_strict_unit_interval(score):.4f}"
 
 
 def log_end(
@@ -948,7 +947,7 @@ def log_end(
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} "
-        f"score={_format_strict_score(score)} rewards={rewards_str}",
+        f"rewards={rewards_str}",
         flush=True,
     )
 
@@ -1129,7 +1128,6 @@ async def run_task(
                 error=error,
                 obs=obs,
             )
-            print("", flush=True)
 
             # Track preemptions in this step for cooldown
             for a in parsed_actions:
@@ -1157,7 +1155,7 @@ async def run_task(
         success = score >= success_threshold
 
     except Exception as exc:
-        print(f"[DEBUG] Task '{task_name}' crashed: {exc}", flush=True)
+        _log_debug(f"[DEBUG] Task '{task_name}' crashed: {exc}")
 
     finally:
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
@@ -1215,44 +1213,44 @@ async def main() -> None:
 
     log_path = _setup_inference_log_file()
     if log_path is not None:
-        print(f"[LOG] Full run output also written to: {log_path}", flush=True)
+        _log_debug(f"[LOG] Full run output also written to: {log_path}")
 
     try:
         # Dump all relevant env vars for debugging
-        print(f"[DEBUG] API_BASE_URL={os.environ.get('API_BASE_URL', '<NOT SET>')!r}", flush=True)
-        print(f"[DEBUG] API_KEY={'set(len=' + str(len(os.environ.get('API_KEY', ''))) + ')' if os.environ.get('API_KEY') else '<NOT SET>'}", flush=True)
-        print(f"[DEBUG] MODEL_NAME={os.environ.get('MODEL_NAME', '<NOT SET>')!r}", flush=True)
-        print(f"[DEBUG] HF_TOKEN={'set' if os.environ.get('HF_TOKEN') else '<NOT SET>'}", flush=True)
-        print(f"[DEBUG] IMAGE_NAME={os.environ.get('IMAGE_NAME', '<NOT SET>')!r}", flush=True)
+        _log_debug(f"[DEBUG] API_BASE_URL={os.environ.get('API_BASE_URL', '<NOT SET>')!r}")
+        _log_debug(f"[DEBUG] API_KEY={'set(len=' + str(len(os.environ.get('API_KEY', ''))) + ')' if os.environ.get('API_KEY') else '<NOT SET>'}")
+        _log_debug(f"[DEBUG] MODEL_NAME={os.environ.get('MODEL_NAME', '<NOT SET>')!r}")
+        _log_debug(f"[DEBUG] HF_TOKEN={'set' if os.environ.get('HF_TOKEN') else '<NOT SET>'}")
+        _log_debug(f"[DEBUG] IMAGE_NAME={os.environ.get('IMAGE_NAME', '<NOT SET>')!r}")
 
         model = _get_model_name()
         client = _make_openai_client()
         api_base = os.environ.get("API_BASE_URL", "(default)")
-        print(f"[INFO] LLM endpoint: {api_base}", flush=True)
-        print(f"[INFO] LLM model: {model}", flush=True)
+        _log_debug(f"[INFO] LLM endpoint: {api_base}")
+        _log_debug(f"[INFO] LLM model: {model}")
 
         # Raw HTTP test: verify the proxy URL is reachable at the network level
         import httpx
         try:
             _probe_url = api_base.rstrip("/") + "/models"
-            print(f"[DEBUG] Raw HTTP probe: GET {_probe_url}", flush=True)
+            _log_debug(f"[DEBUG] Raw HTTP probe: GET {_probe_url}")
             _resp = httpx.get(_probe_url, headers={"Authorization": f"Bearer {os.environ.get('API_KEY', '')}"}, timeout=15)
-            print(f"[DEBUG] Raw HTTP probe status: {_resp.status_code}", flush=True)
+            _log_debug(f"[DEBUG] Raw HTTP probe status: {_resp.status_code}")
         except Exception as _he:
-            print(f"[WARN] Raw HTTP probe failed: {_he}", flush=True)
+            _log_debug(f"[WARN] Raw HTTP probe failed: {_he}")
 
         # Smoke-test: verify the LLM proxy works with a real completion request.
         # If this fails, we CRASH — continuing would produce zero API calls.
-        print("[INFO] Testing LLM proxy with a real API call...", flush=True)
+        _log_debug("[INFO] Testing LLM proxy with a real API call...")
         _test = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "Say OK"}],
             max_tokens=3,
         )
-        print(f"[INFO] LLM proxy test PASSED: {_test.choices[0].message.content!r}", flush=True)
+        _log_debug(f"[INFO] LLM proxy test PASSED: {_test.choices[0].message.content!r}")
 
         base_url = _resolve_base_url(_get_image_name())
-        print(f"[INFO] Connecting to environment at: {base_url}", flush=True)
+        _log_debug(f"[INFO] Connecting to environment at: {base_url}")
         env = GpuSchedulerEnv(base_url=base_url)
 
         # Select tasks to run
@@ -1275,30 +1273,25 @@ async def main() -> None:
                     )
                     results[task_name] = passed
                 except Exception as exc:
-                    print(f"[DEBUG] Task '{task_name}' failed: {exc}", flush=True)
+                    _log_debug(f"[DEBUG] Task '{task_name}' failed: {exc}")
                     results[task_name] = False
-                print("", flush=True)
 
             # Final summary
             all_passed = all(results.values()) if results else False
             summary = " | ".join(
                 f"{t}={'PASS' if v else 'FAIL'}" for t, v in results.items()
             )
-            print(
-                f"[SUMMARY] {summary} | all_passed={str(all_passed).lower()}",
-                flush=True,
+            _log_debug(
+                f"[SUMMARY] {summary} | all_passed={str(all_passed).lower()}"
             )
 
         finally:
             try:
                 await env.close()
             except Exception as e:
-                print(
-                    f"[DEBUG] env.close() error: {e}",
-                    flush=True,
-                )
+                _log_debug(f"[DEBUG] env.close() error: {e}")
     except Exception as exc:
-        print(f"[ERROR] Fatal: {exc}", flush=True)
+        _log_debug(f"[ERROR] Fatal: {exc}")
         sys.exit(1)
     finally:
         _teardown_inference_log_file()

@@ -184,10 +184,6 @@ tasks:
 # Environment variables required at runtime
 # ---------------------------------------------------------------------------
 env_vars:
-  GPU_SCHEDULER_TASK:
-    description: "Which task to run on reset(). Set by inference.py before each episode."
-    default: "smooth_sailing"
-    required: false
   API_BASE_URL:
     description: "The API endpoint for the LLM used by inference.py."
     default: "https://router.huggingface.co/v1"
@@ -196,11 +192,12 @@ env_vars:
     description: "The model identifier to use for inference."
     default: "Qwen/Qwen2.5-72B-Instruct"
     required: false
-  API_KEY:
-    description: "LiteLLM proxy key injected by the validator for OpenAI-compatible calls."
-    required: false
   HF_TOKEN:
-    description: "Fallback local-development API key when API_KEY is not provided."
+    description: "Hugging Face API token for LLM access."
+    required: true
+  GPU_SCHEDULER_TASK:
+    description: "Which task to run on reset(). Set by inference.py before each episode."
+    default: "smooth_sailing"
     required: false
 
 # ---------------------------------------------------------------------------
