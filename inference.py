@@ -912,6 +912,21 @@ def log_start(task: str, env_name: str, model: str) -> None:
     print(f"[START] task={task} env={env_name} model={model}", flush=True)
 
 
+def _stdout_field(value: Optional[str], *, null_value: str = "null") -> str:
+    """
+    Normalize a stdout field so the evaluator always sees a single-line value.
+
+    The hackathon spec requires every emitted field to stay on one line. When
+    the environment returns multiline error text, collapse internal whitespace
+    rather than letting it break the `[STEP]` record format.
+    """
+    if value is None:
+        return null_value
+
+    normalized = re.sub(r"\s+", " ", str(value)).strip()
+    return normalized or null_value
+
+
 def log_step(
     step: int,
     action: str,
@@ -921,9 +936,10 @@ def log_step(
     obs: Optional[GpuSchedulerObservation] = None,
 ) -> None:
     """Emit one [STEP] line immediately after env.step() returns."""
-    error_val = error if error else "null"
+    action_val = _stdout_field(action, null_value="WAIT")
+    error_val = _stdout_field(error)
     print(
-        f"[STEP] step={step} action={action} "
+        f"[STEP] step={step} action={action_val} "
         f"reward={reward:.2f} done={str(done).lower()} error={error_val}",
         flush=True,
     )
@@ -944,7 +960,7 @@ def log_end(
     rewards: List[float],
 ) -> None:
     """Emit the mandatory [END] line after env.close() or episode completion."""
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards) or "0.00"
     print(
         f"[END] success={str(success).lower()} steps={steps} "
         f"rewards={rewards_str}",
@@ -1282,7 +1298,7 @@ async def main() -> None:
                 f"{t}={'PASS' if v else 'FAIL'}" for t, v in results.items()
             )
             _log_debug(
-                f"[SUMMARY] {summary} | all_passed={str(all_passed).lower()}"
+                f"[INFO] Summary: {summary} | all_passed={str(all_passed).lower()}"
             )
 
         finally:
